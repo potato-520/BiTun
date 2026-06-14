@@ -18,56 +18,71 @@
 
 ## 📐 システムアーキテクチャとデータフロー (System Architecture)
 
-```text
-                  +---------------------------------------+
-                  |           BiTun アーキテクチャ        |
-                  +---------------------------------------+
+```mermaid
+graph TD
+    %% 色彩スタイルの定義
+    classDef peerA fill:#1d3557,stroke:#457b9d,stroke-width:2px,color:#fff;
+    classDef peerB fill:#2a9d8f,stroke:#264653,stroke-width:2px,color:#fff;
+    classDef network fill:#e76f51,stroke:#f4a261,stroke-width:2px,color:#fff;
+    
+    subgraph PeerA ["Peer A (Symmetric Endpoint)"]
+        A_TCP["ローカル TCP 受信 / 接続<br>(SOCKS5 / Forward L / R)"]:::peerA
+        A_Mux["多重化チャネル制御層<br>(奇偶 ID 隔離、フロー制御)"]:::peerA
+        A_KCP["KCP プロトコル層<br>(低遅延再転送、混雑制御)"]:::peerA
+        A_AEAD["AEAD セキュリティ層<br>(ChaCha20-Poly1305、防御)"]:::peerA
+    end
 
-      [ Peer A (Symmetric Endpoint) ]            [ Peer B (Symmetric Endpoint) ]
-      +------------------------------+            +------------------------------+
-      |  ローカル TCP 受信 / 接続    |            |  ローカル TCP 受信 / 接続    |
-      |  (SOCKS5 / Forward L / R)    |            |  (SOCKS5 / Forward L / R)    |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |    多重化チャネル制御層      |            |    多重化チャネル制御層      |
-      | (奇偶 ID 隔離、フロー制御)   |            | (奇偶 ID 隔離、フロー制御)   |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |          KCP プロトコル層    |            |          KCP プロトコル層    |
-      |     (低遅延再転送、混雑制御) |            |     (低遅延再転送、混雑制御) |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |       AEAD セキュリティ層    |            |       AEAD セキュリティ層    |
-      |  (ChaCha20-Poly1305、防御)   |            |  (ChaCha20-Poly1305、防御)   |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     +================== UDP ====================+
-                                  (対称ホールパンチ /
-                                   コネクションマイグレーション)
+    subgraph PeerB ["Peer B (Symmetric Endpoint)"]
+        B_TCP["ローカル TCP 受信 / 接続<br>(SOCKS5 / Forward L / R)"]:::peerB
+        B_Mux["多重化チャネル制御層<br>(奇偶 ID 隔離、フロー制御)"]:::peerB
+        B_KCP["KCP プロトコル層<br>(低遅延再転送、混雑制御)"]:::peerB
+        B_AEAD["AEAD セキュリティ層<br>(ChaCha20-Poly1305、防御)"]:::peerB
+    end
+
+    %% 内部レイヤー間のフロー
+    A_TCP <=> A_Mux
+    A_Mux <=> A_KCP
+    A_KCP <=> A_AEAD
+
+    B_TCP <=> B_Mux
+    B_Mux <=> B_KCP
+    B_KCP <=> B_AEAD
+
+    %% ネットワーク転送
+    A_AEAD <== "UDP ネットワーク転送<br>(対称ホールパンチ / コネクションマイグレーション)" ===> B_AEAD:::network
 ```
 
-### データフローパターン
+### データフローパターン (Traffic Flows)
 
-1. **動的 SOCKS5 プロキシモード (ssh -D)**
-   ```text
-   [ブラウザ/クライアント] --(TCP)--> [Peer A (SOCKS5ポート)] ===(暗号化KCP)===> [Peer B] --(TCP)--> [ターゲットサーバー]
-   ```
+```mermaid
+graph TD
+    %% スタイルの定義
+    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
+    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
+    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
+    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
 
-2. **ローカル静的ポートフォワーディングモード (ssh -L)**
-   ```text
-   [ローカルアプリ] --(TCP)--> [Peer A (ローカルポート)] ===(暗号化KCP)===> [Peer B] --(TCP)--> [ターゲットサーバー]
-   ```
+    %% シナリオ 1
+    subgraph Mode1 ["1. 動的 SOCKS5 プロキシモード (ssh -D)"]
+        M1_Client["ブラウザ / クライアント"]:::app -- "TCP (ネゴシエーション)" --> M1_PeerA["Peer A (SOCKS5ポート)"]:::bitunA
+        M1_PeerA -- "暗号化 KCP トンネル" --> M1_PeerB["Peer B"]:::bitunB
+        M1_PeerB -- "TCP 接続" --> M1_Target["ターゲットサーバー"]:::dest
+    end
 
-3. **リモート逆方向静的ポートフォワーディングモード (ssh -R)**
-   ```text
-   [パブリックユーザ] --(TCP)--> [Peer B (VPSポート)] ===(暗号化KCP)===> [Peer A] --(TCP)--> [ローカルサービス]
-   ```
+    %% シナリオ 2
+    subgraph Mode2 ["2. ローカル静的ポートフォワーディングモード (ssh -L)"]
+        M2_Client["ローカルアプリ"]:::app -- "TCP (固定ポート)" --> M2_PeerA["Peer A (ローカル監視)"]:::bitunA
+        M2_PeerA -- "暗号化 KCP トンネル" --> M2_PeerB["Peer B"]:::bitunB
+        M2_PeerB -- "TCP 接続" --> M2_Target["ターゲットサーバー"]:::dest
+    end
+
+    %% シナリオ 3
+    subgraph Mode3 ["3. リモート逆方向静的ポートフォワーディングモード (ssh -R)"]
+        M3_Client["パブリックユーザ"]:::app -- "TCP (パブリックポート)" --> M3_PeerB["Peer B (パブリック監視)"]:::bitunB
+        M3_PeerB -- "暗号化 KCP トンネル" --> M3_PeerA["Peer A"]:::bitunA
+        M3_PeerA -- "TCP 接続" --> M3_Target["ローカルサービス"]:::dest
+    end
+```
 
 ---
 

@@ -18,56 +18,71 @@
 
 ## 📐 系统架构与数据流向 (System Architecture)
 
-```text
-                  +---------------------------------------+
-                  |           BiTun 架构设计图            |
-                  +---------------------------------------+
+```mermaid
+graph TD
+    %% 定义色彩风格
+    classDef peerA fill:#1d3557,stroke:#457b9d,stroke-width:2px,color:#fff;
+    classDef peerB fill:#2a9d8f,stroke:#264653,stroke-width:2px,color:#fff;
+    classDef network fill:#e76f51,stroke:#f4a261,stroke-width:2px,color:#fff;
+    
+    subgraph PeerA ["Peer A (Symmetric Endpoint)"]
+        A_TCP["本地 TCP 监听 / 建立连接<br>(SOCKS5 / Forward L / R)"]:::peerA
+        A_Mux["多路复用分路控制层<br>(奇偶 ID 隔离, 通道级流控)"]:::peerA
+        A_KCP["KCP 协议层<br>(低延迟重传、拥塞控制)"]:::peerA
+        A_AEAD["AEAD 安全保护垫<br>(ChaCha20-Poly1305, 防重放)"]:::peerA
+    end
 
-      [ Peer A (Symmetric Endpoint) ]            [ Peer B (Symmetric Endpoint) ]
-      +------------------------------+            +------------------------------+
-      |  本地 TCP 监听 / 建立连接    |            |  本地 TCP 监听 / 建立连接    |
-      |  (SOCKS5 / Forward L / R)    |            |  (SOCKS5 / Forward L / R)    |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |    多路复用分路控制层        |            |    多路复用分路控制层        |
-      | (奇偶 ID 隔离, 通道级流控)   |            | (奇偶 ID 隔离, 通道级流控)   |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |          KCP 协议层          |            |          KCP 协议层          |
-      |   (低延迟重传、拥塞控制)     |            |   (低延迟重传、拥塞控制)     |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |      AEAD 安全保护垫         |            |      AEAD 安全保护垫         |
-      | (ChaCha20-Poly1305,防重放)   |            | (ChaCha20-Poly1305,防重放)   |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     +================== UDP ====================+
-                                  (对称打洞对冲 /
-                                   连接热迁移)
+    subgraph PeerB ["Peer B (Symmetric Endpoint)"]
+        B_TCP["本地 TCP 监听 / 建立连接<br>(SOCKS5 / Forward L / R)"]:::peerB
+        B_Mux["多路复用分路控制层<br>(奇偶 ID 隔离, 通道级流控)"]:::peerB
+        B_KCP["KCP 协议层<br>(低延迟重传、拥塞控制)"]:::peerB
+        B_AEAD["AEAD 安全保护垫<br>(ChaCha20-Poly1305, 防重放)"]:::peerB
+    end
+
+    %% 内部层级流动
+    A_TCP <=> A_Mux
+    A_Mux <=> A_KCP
+    A_KCP <=> A_AEAD
+
+    B_TCP <=> B_Mux
+    B_Mux <=> B_KCP
+    B_KCP <=> B_AEAD
+
+    %% 底层网络传输
+    A_AEAD <== "UDP 网络传输<br>(对称打洞对冲 / 连接热迁移)" ===> B_AEAD:::network
 ```
 
-### 流量平移数据流向
+### 流量平移数据流向 (Traffic Flows)
 
-1. **动态 SOCKS5 代理模式 (ssh -D)**
-   ```text
-   [浏览器/客户端] --(TCP)--> [Peer A (SOCKS5 端口)] ===(加密 KCP 隧道)===> [Peer B] --(TCP)--> [目标服务器]
-   ```
+```mermaid
+graph TD
+    %% 样式定义
+    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
+    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
+    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
+    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
 
-2. **本地静态端口转发模式 (ssh -L)**
-   ```text
-   [本地应用] --(TCP)--> [Peer A (本地监听端口)] ===(加密 KCP 隧道)===> [Peer B] --(TCP)--> [目标服务器]
-   ```
+    %% 场景 1
+    subgraph Mode1 ["1. 动态 SOCKS5 代理模式 (ssh -D)"]
+        M1_Client["浏览器 / 客户端"]:::app -- "TCP (协商)" --> M1_PeerA["Peer A (SOCKS5 端口)"]:::bitunA
+        M1_PeerA -- "加密 KCP 隧道" --> M1_PeerB["Peer B"]:::bitunB
+        M1_PeerB -- "TCP 连接" --> M1_Target["目标服务器"]:::dest
+    end
 
-3. **远端反向静态转发模式 (ssh -R)**
-   ```text
-   [公网用户] --(TCP)--> [Peer B (公网监听端口)] ===(加密 KCP 隧道)===> [Peer A] --(TCP)--> [本地目标服务]
-   ```
+    %% 场景 2
+    subgraph Mode2 ["2. 本地静态端口转发模式 (ssh -L)"]
+        M2_Client["本地应用"]:::app -- "TCP (固定端口)" --> M2_PeerA["Peer A (本地监听)"]:::bitunA
+        M2_PeerA -- "加密 KCP 隧道" --> M2_PeerB["Peer B"]:::bitunB
+        M2_PeerB -- "TCP 连接" --> M2_Target["目标服务器"]:::dest
+    end
+
+    %% 场景 3
+    subgraph Mode3 ["3. 远端反向静态转发模式 (ssh -R)"]
+        M3_Client["公网用户"]:::app -- "TCP (公网端口)" --> M3_PeerB["Peer B (公网监听)"]:::bitunB
+        M3_PeerB -- "加密 KCP 隧道" --> M3_PeerA["Peer A"]:::bitunA
+        M3_PeerA -- "TCP 连接" --> M3_Target["本地目标服务"]:::dest
+    end
+```
 
 ---
 

@@ -18,56 +18,71 @@ Over a single encrypted UDP tunnel, BiTun supports **Dynamic SOCKS5 Proxies (equ
 
 ## 📐 System Architecture & Data Flow
 
-```text
-                  +---------------------------------------+
-                  |           BiTun Architecture          |
-                  +---------------------------------------+
+```mermaid
+graph TD
+    %% Define color styles
+    classDef peerA fill:#1d3557,stroke:#457b9d,stroke-width:2px,color:#fff;
+    classDef peerB fill:#2a9d8f,stroke:#264653,stroke-width:2px,color:#fff;
+    classDef network fill:#e76f51,stroke:#f4a261,stroke-width:2px,color:#fff;
+    
+    subgraph PeerA ["Peer A (Symmetric Endpoint)"]
+        A_TCP["Local TCP Listen / Connect<br>(SOCKS5 / Forward L / R)"]:::peerA
+        A_Mux["Channel Multiplexing Layer<br>(Odd/Even IDs, Flow Control)"]:::peerA
+        A_KCP["KCP Layer<br>(Low Latency Retransmit, Congestion Control)"]:::peerA
+        A_AEAD["AEAD Security Shim<br>(ChaCha20-Poly1305, Anti-Replay)"]:::peerA
+    end
 
-      [ Peer A (Symmetric Endpoint) ]            [ Peer B (Symmetric Endpoint) ]
-      +------------------------------+            +------------------------------+
-      |  Local TCP Listen / Connect  |            |  Local TCP Listen / Connect  |
-      |  (SOCKS5 / Forward L / R)    |            |  (SOCKS5 / Forward L / R)    |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |     Channel Multiplexing     |            |     Channel Multiplexing     |
-      | (Odd/Even IDs, Flow Control) |            | (Odd/Even IDs, Flow Control) |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |          KCP Layer           |            |          KCP Layer           |
-      |   (Reliable Transmission)    |            |   (Reliable Transmission)    |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     v                                           v
-      +--------------+---------------+            +--------------+---------------+
-      |      AEAD Security Shim      |            |      AEAD Security Shim      |
-      |    (ChaCha20-Poly1305)       |            |    (ChaCha20-Poly1305)       |
-      +--------------+---------------+            +--------------+---------------+
-                     |                                           |
-                     +================== UDP ====================+
-                                  (Symmetric Punching /
-                                   Connection Migration)
+    subgraph PeerB ["Peer B (Symmetric Endpoint)"]
+        B_TCP["Local TCP Listen / Connect<br>(SOCKS5 / Forward L / R)"]:::peerB
+        B_Mux["Channel Multiplexing Layer<br>(Odd/Even IDs, Flow Control)"]:::peerB
+        B_KCP["KCP Layer<br>(Low Latency Retransmit, Congestion Control)"]:::peerB
+        B_AEAD["AEAD Security Shim<br>(ChaCha20-Poly1305, Anti-Replay)"]:::peerB
+    end
+
+    %% Internal layer flows
+    A_TCP <=> A_Mux
+    A_Mux <=> A_KCP
+    A_KCP <=> A_AEAD
+
+    B_TCP <=> B_Mux
+    B_Mux <=> B_KCP
+    B_KCP <=> B_AEAD
+
+    %% Network Transport
+    A_AEAD <== "UDP Network Transport<br>(Symmetric Punching / Connection Migration)" ===> B_AEAD:::network
 ```
 
-### Data Flow Patterns
+### Traffic Flow Patterns (Traffic Flows)
 
-1. **Dynamic SOCKS5 Proxy Mode (ssh -D)**
-   ```text
-   [Browser/App] --(TCP)--> [Peer A (SOCKS5 Port)] ===(Encrypted KCP)===> [Peer B] --(TCP)--> [Target Server]
-   ```
+```mermaid
+graph TD
+    %% Style definitions
+    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
+    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
+    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
+    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
 
-2. **Local Port Forwarding Mode (ssh -L)**
-   ```text
-   [Local App] --(TCP)--> [Peer A (Local Port)] ===(Encrypted KCP)===> [Peer B] --(TCP)--> [Target Server]
-   ```
+    %% Scenario 1
+    subgraph Mode1 ["1. Dynamic SOCKS5 Proxy Mode (ssh -D)"]
+        M1_Client["Browser / Client"]:::app -- "TCP (Negotiation)" --> M1_PeerA["Peer A (SOCKS5 Port)"]:::bitunA
+        M1_PeerA -- "Encrypted KCP Tunnel" --> M1_PeerB["Peer B"]:::bitunB
+        M1_PeerB -- "TCP Connection" --> M1_Target["Target Server"]:::dest
+    end
 
-3. **Remote Port Forwarding Mode (ssh -R)**
-   ```text
-   [Public User] --(TCP)--> [Peer B (VPS Port)] ===(Encrypted KCP)===> [Peer A] --(TCP)--> [Local Target Service]
-   ```
+    %% Scenario 2
+    subgraph Mode2 ["2. Local Port Forwarding Mode (ssh -L)"]
+        M2_Client["Local App"]:::app -- "TCP (Static Port)" --> M2_PeerA["Peer A (Local Listener)"]:::bitunA
+        M2_PeerA -- "Encrypted KCP Tunnel" --> M2_PeerB["Peer B"]:::bitunB
+        M2_PeerB -- "TCP Connection" --> M2_Target["Target Server"]:::dest
+    end
+
+    %% Scenario 3
+    subgraph Mode3 ["3. Remote Port Forwarding Mode (ssh -R)"]
+        M3_Client["Public User"]:::app -- "TCP (Public Port)" --> M3_PeerB["Peer B (Public Listener)"]:::bitunB
+        M3_PeerB -- "Encrypted KCP Tunnel" --> M3_PeerA["Peer A"]:::bitunA
+        M3_PeerA -- "TCP Connection" --> M3_Target["Local Target Service"]:::dest
+    end
+```
 
 ---
 
