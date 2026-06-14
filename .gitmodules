@@ -1,0 +1,3 @@
+[submodule "ESP32_ports"]
+	path = ESP32_ports
+	url = https://github.com/potato-520/BareTcl_BiTun_shared.git
