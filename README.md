@@ -19,7 +19,7 @@
 ## 📐 系统架构与数据流向 (System Architecture)
 
 ```mermaid
-graph TD
+flowchart TD
     %% 定义色彩风格
     classDef peerA fill:#1d3557,stroke:#457b9d,stroke-width:2px,color:#fff;
     classDef peerB fill:#2a9d8f,stroke:#264653,stroke-width:2px,color:#fff;
@@ -40,48 +40,57 @@ graph TD
     end
 
     %% 内部层级流动
-    A_TCP <=> A_Mux
-    A_Mux <=> A_KCP
-    A_KCP <=> A_AEAD
+    A_TCP <--> A_Mux
+    A_Mux <--> A_KCP
+    A_KCP <--> A_AEAD
 
-    B_TCP <=> B_Mux
-    B_Mux <=> B_KCP
-    B_KCP <=> B_AEAD
+    B_TCP <--> B_Mux
+    B_Mux <--> B_KCP
+    B_KCP <--> B_AEAD
 
     %% 底层网络传输
-    A_AEAD <== "UDP 网络传输<br>(对称打洞对冲 / 连接热迁移)" ===> B_AEAD:::network
+    A_AEAD <--> B_AEAD:::network
 ```
 
 ### 流量平移数据流向 (Traffic Flows)
 
+#### 1. 动态 SOCKS5 代理模式 (ssh -D)
 ```mermaid
-graph TD
-    %% 样式定义
+flowchart LR
     classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
     classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
     classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
     classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
 
-    %% 场景 1
-    subgraph Mode1 ["1. 动态 SOCKS5 代理模式 (ssh -D)"]
-        M1_Client["浏览器 / 客户端"]:::app -- "TCP (协商)" --> M1_PeerA["Peer A (SOCKS5 端口)"]:::bitunA
-        M1_PeerA -- "加密 KCP 隧道" --> M1_PeerB["Peer B"]:::bitunB
-        M1_PeerB -- "TCP 连接" --> M1_Target["目标服务器"]:::dest
-    end
+    M1_Client["浏览器 / 客户端"]:::app --> M1_PeerA["Peer A (SOCKS5 端口)"]:::bitunA
+    M1_PeerA -- "加密 KCP 隧道" --> M1_PeerB["Peer B"]:::bitunB
+    M1_PeerB --> M1_Target["目标服务器"]:::dest
+```
 
-    %% 场景 2
-    subgraph Mode2 ["2. 本地静态端口转发模式 (ssh -L)"]
-        M2_Client["本地应用"]:::app -- "TCP (固定端口)" --> M2_PeerA["Peer A (本地监听)"]:::bitunA
-        M2_PeerA -- "加密 KCP 隧道" --> M2_PeerB["Peer B"]:::bitunB
-        M2_PeerB -- "TCP 连接" --> M2_Target["目标服务器"]:::dest
-    end
+#### 2. 本地静态端口转发模式 (ssh -L)
+```mermaid
+flowchart LR
+    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
+    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
+    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
+    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
 
-    %% 场景 3
-    subgraph Mode3 ["3. 远端反向静态转发模式 (ssh -R)"]
-        M3_Client["公网用户"]:::app -- "TCP (公网端口)" --> M3_PeerB["Peer B (公网监听)"]:::bitunB
-        M3_PeerB -- "加密 KCP 隧道" --> M3_PeerA["Peer A"]:::bitunA
-        M3_PeerA -- "TCP 连接" --> M3_Target["本地目标服务"]:::dest
-    end
+    M2_Client["本地应用"]:::app --> M2_PeerA["Peer A (本地监听)"]:::bitunA
+    M2_PeerA -- "加密 KCP 隧道" --> M2_PeerB["Peer B"]:::bitunB
+    M2_PeerB --> M2_Target["目标服务器"]:::dest
+```
+
+#### 3. 远端反向静态转发模式 (ssh -R)
+```mermaid
+flowchart LR
+    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
+    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
+    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
+    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
+
+    M3_Client["公网用户"]:::app --> M3_PeerB["Peer B (公网监听)"]:::bitunB
+    M3_PeerB -- "加密 KCP 隧道" --> M3_PeerA["Peer A"]:::bitunA
+    M3_PeerA --> M3_Target["本地目标服务"]:::dest
 ```
 
 ---

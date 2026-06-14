@@ -19,7 +19,7 @@
 ## 📐 システムアーキテクチャとデータフロー (System Architecture)
 
 ```mermaid
-graph TD
+flowchart TD
     %% 色彩スタイルの定義
     classDef peerA fill:#1d3557,stroke:#457b9d,stroke-width:2px,color:#fff;
     classDef peerB fill:#2a9d8f,stroke:#264653,stroke-width:2px,color:#fff;
@@ -40,48 +40,57 @@ graph TD
     end
 
     %% 内部レイヤー間のフロー
-    A_TCP <=> A_Mux
-    A_Mux <=> A_KCP
-    A_KCP <=> A_AEAD
+    A_TCP <--> A_Mux
+    A_Mux <--> A_KCP
+    A_KCP <--> A_AEAD
 
-    B_TCP <=> B_Mux
-    B_Mux <=> B_KCP
-    B_KCP <=> B_AEAD
+    B_TCP <--> B_Mux
+    B_Mux <--> B_KCP
+    B_KCP <--> B_AEAD
 
     %% ネットワーク転送
-    A_AEAD <== "UDP ネットワーク転送<br>(対称ホールパンチ / コネクションマイグレーション)" ===> B_AEAD:::network
+    A_AEAD <--> B_AEAD:::network
 ```
 
 ### データフローパターン (Traffic Flows)
 
+#### 1. 動的 SOCKS5 プロキシモード (ssh -D)
 ```mermaid
-graph TD
-    %% スタイルの定義
+flowchart LR
     classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
     classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
     classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
     classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
 
-    %% シナリオ 1
-    subgraph Mode1 ["1. 動的 SOCKS5 プロキシモード (ssh -D)"]
-        M1_Client["ブラウザ / クライアント"]:::app -- "TCP (ネゴシエーション)" --> M1_PeerA["Peer A (SOCKS5ポート)"]:::bitunA
-        M1_PeerA -- "暗号化 KCP トンネル" --> M1_PeerB["Peer B"]:::bitunB
-        M1_PeerB -- "TCP 接続" --> M1_Target["ターゲットサーバー"]:::dest
-    end
+    M1_Client["ブラウザ / クライアント"]:::app --> M1_PeerA["Peer A (SOCKS5ポート)"]:::bitunA
+    M1_PeerA -- "暗号化 KCP トンネル" --> M1_PeerB["Peer B"]:::bitunB
+    M1_PeerB --> M1_Target["ターゲットサーバー"]:::dest
+```
 
-    %% シナリオ 2
-    subgraph Mode2 ["2. ローカル静的ポートフォワーディングモード (ssh -L)"]
-        M2_Client["ローカルアプリ"]:::app -- "TCP (固定ポート)" --> M2_PeerA["Peer A (ローカル監視)"]:::bitunA
-        M2_PeerA -- "暗号化 KCP トンネル" --> M2_PeerB["Peer B"]:::bitunB
-        M2_PeerB -- "TCP 接続" --> M2_Target["ターゲットサーバー"]:::dest
-    end
+#### 2. ローカル静的ポートフォワーディングモード (ssh -L)
+```mermaid
+flowchart LR
+    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
+    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
+    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
+    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
 
-    %% シナリオ 3
-    subgraph Mode3 ["3. リモート逆方向静的ポートフォワーディングモード (ssh -R)"]
-        M3_Client["パブリックユーザ"]:::app -- "TCP (パブリックポート)" --> M3_PeerB["Peer B (パブリック監視)"]:::bitunB
-        M3_PeerB -- "暗号化 KCP トンネル" --> M3_PeerA["Peer A"]:::bitunA
-        M3_PeerA -- "TCP 接続" --> M3_Target["ローカルサービス"]:::dest
-    end
+    M2_Client["ローカルアプリ"]:::app --> M2_PeerA["Peer A (ローカル監視)"]:::bitunA
+    M2_PeerA -- "暗号化 KCP トンネル" --> M2_PeerB["Peer B"]:::bitunB
+    M2_PeerB --> M2_Target["ターゲットサーバー"]:::dest
+```
+
+#### 3. リモート逆方向静的ポートフォワーディングモード (ssh -R)
+```mermaid
+flowchart LR
+    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
+    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
+    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
+    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
+
+    M3_Client["パブリックユーザ"]:::app --> M3_PeerB["Peer B (パブリック監視)"]:::bitunB
+    M3_PeerB -- "暗号化 KCP トンネル" --> M3_PeerA["Peer A"]:::bitunA
+    M3_PeerA --> M3_Target["ローカルサービス"]:::dest
 ```
 
 ---
