@@ -1,0 +1,14 @@
+# Build binaries
+bitun
+
+# Object files
+*.o
+src/*.o
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/
+.DS_Store
