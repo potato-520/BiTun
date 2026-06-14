@@ -17,7 +17,7 @@
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **3. 控制帧与数据帧** | 定义 `channel_id` (奇偶)、`cmd_type` (0x01-0x06) 及载荷结构 | [src/tunnel.h](file:///home/chenming/BiTun/src/tunnel.h) | 结构体 `handshake_*`、`dns_result_t`、`CMD_*` 宏定义 | [L93-L135](file:///home/chenming/BiTun/src/tunnel.h#L93-L135) | 协议字段与字节映射完全匹配，奇偶 ID 分配逻辑实现在 `tunnel.c` 中。 |
 | **4.1 角色与动态学习** | 支持主动探测 (Active) 与被动监听/反射学习 (Passive) 双模式，防双被动死锁。 | [src/tunnel.c](file:///home/chenming/BiTun/src/tunnel.c) | `tunnel_init`、`reset_tunnel`；`main.c` 校验 | [L80-L122](file:///home/chenming/BiTun/src/tunnel.c#L80-L122)；[L311-L317](file:///home/chenming/BiTun/src/tunnel.c#L311-L317) | 实现了对 0.0.0.0 和端口的被动判断。双被动阻断机制实现在 `main.c` 中。 |
-| **4.2 对冲握手状态机** | `DISCONNECTED`、`PUNCHING`、`AUTH`、`CONNECTED` 状态迁移与 PING/PONG 周期探测。 | [src/tunnel.c](file:///home/chenming/BiTun/src/tunnel.c) | `tunnel_run` 状态机大循环分支 | [L328-L382](file:///home/chenming/BiTun/src/tunnel.c#L328-L382) | 严格按照 Mermaid 状态转移图实现，包含 500ms 重传和 30s 超时退回。 |
+| **4.2 对称打洞状态机** | `DISCONNECTED`、`PUNCHING`、`AUTH`、`CONNECTED` 状态迁移与 PING/PONG 周期探测。 | [src/tunnel.c](file:///home/chenming/BiTun/src/tunnel.c) | `tunnel_run` 状态机大循环分支 | [L328-L382](file:///home/chenming/BiTun/src/tunnel.c#L328-L382) | 严格按照 Mermaid 状态转移图实现，包含 500ms 重传和 30s 超时退回。 |
 | **4.2.1 状态同步拉回** | 已连接端收到 `AUTH_CHALLENGE` 报文时重算并回复 `AUTH_RESPONSE` 拉回对端状态。 | [src/tunnel.c](file:///home/chenming/BiTun/src/tunnel.c) | `tunnel_run` 中的 `MSG_CHAL` 校验处理 | [L569-L592](file:///home/chenming/BiTun/src/tunnel.c#L569-L592) | 即使在 `STATE_CONNECTED` 下收到 `CHAL` 也会回发 `RESP`，避免半连接死锁。 |
 | **4.3 快速重连与 AUTH_RESET** | 8B 时间戳 + 8B 随机盐 + 32B HMAC 签名重置包，防 5 秒窗内重放，毫秒级快速状态重置。 | [src/tunnel.c](file:///home/chenming/BiTun/src/tunnel.c) | `send_auth_reset`、`tunnel_run` 中的 `MSG_RESET` 校验 | [L272-L291](file:///home/chenming/BiTun/src/tunnel.c#L272-L291)；[L632-L670](file:///home/chenming/BiTun/src/tunnel.c#L632-L670) | 使用 ±5s 误差校验，并在 `last_reset_timestamp` 及 `last_reset_salt` 保护下防重放。 |
 | **4.4 连接迁移机制** | 收到新源 IP:Port，经 AEAD 解密校验成功后动态平滑更新 Peer 目标地址。 | [src/tunnel.c](file:///home/chenming/BiTun/src/tunnel.c) | `tunnel_run` 中 UDP 报文 AEAD 校验分支 | [L700-L707](file:///home/chenming/BiTun/src/tunnel.c#L700-L707) | 收到包先用 `Session_Key` 校验，成功后直接赋值 `tun->peer_addr = from`，KCP 状态完整保留。 |
@@ -125,7 +125,7 @@
     *   两端在大循环中发出首个明文 `PING`，并附加了 `AUTH_RESET` 帧。
 2.  **重置与握手触发 (L644-670)**：
     *   Peer B 接收到了 Peer A 的 `AUTH_RESET` 重置帧，在 `const_memcmp` 校验通过后，由于 B 此时刚处于打洞初始，它打印了：`Received Authenticated Reset. Resetting tunnel.`。这证明了 A 端的重置指令被 B 端成功捕获并安全释放了可能悬空的资源。
-3.  **对冲状态转化 (L515-592)**：
+3.  **对称打洞状态转化 (L515-592)**：
     *   A 端收到了 B 回复的 `PONG`。时序图逻辑激活，A 转换状态：`Received valid PONG. Transitioned to STATE_AUTH.`。同时生成了 32 字节 $R_A$，发出 `AUTH_CHALLENGE`。
     *   B 端同样收到 A 的挑战，转换状态并回复。
 4.  **动态密钥协商与信道确立 (L601-620, L8.2)**：

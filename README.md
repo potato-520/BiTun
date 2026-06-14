@@ -4,7 +4,7 @@
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 [![Language: C](https://img.shields.io/badge/Language-C-blue.svg)]()
 
-**BiTun** 是一个用纯 C 语言编写的、完全对称的、基于 KCP 与 UDP 的双向全双工加密通道工具。它不仅实现了强大的对冲打洞与连接迁移能力，还融合了 ChaCha20-Poly1305 AEAD 加密、滑动窗口防重放、以及通道级流控设计。
+**BiTun** 是一个用纯 C 语言编写的、完全对称的、基于 KCP 与 UDP 的双向全双工加密通道工具。它不仅实现了强大的对称打洞与连接迁移能力，还融合了 ChaCha20-Poly1305 AEAD 加密、滑动窗口防重放、以及通道级流控设计。
 
 通过单一加密隧道，BiTun 同时支持了**动态 SOCKS5 代理（类似 `ssh -D`）**、**本地静态端口转发（类似 `ssh -L`）**和**远端反向静态转发（类似 `ssh -R`）**。
 
@@ -99,7 +99,7 @@ flowchart LR
 
 1. **完全对称对等端架构 (Fully Symmetric Peer-to-Peer)**
    * 两端运行完全相同的程序与状态机，不区分传统的客户端/服务端（Client/Server）。
-   * 支持**双向对冲打洞**与**被动监听/动态学习（Passive/Dynamic Learning）**模式。若一端配置为被动模式，它将通过收到的首个合法 UDP 包反射学习对端的 IP:Port 并绑定，实现灵活的单/双向打洞。
+   * 支持**双向对称打洞**与**被动监听/动态学习（Passive/Dynamic Learning）**模式。若一端配置为被动模式，它将通过收到的首个合法 UDP 包反射学习对端的 IP:Port 并绑定，实现灵活的单/双向打洞。
 2. **KCP 可靠传输与多路复用 (KCP & Channel Multiplexing)**
    * 在 UDP 之上集成了 KCP 可靠协议，提供低延迟、快速重传的 ARQ 流控。
    * 在单个 KCP 连接上实现多路复用，每个活跃通道（Channel）映射一个应用层 TCP 连接，分配奇偶 Channel ID 隔离双端并发。
@@ -189,7 +189,7 @@ bitun -m <mode> -p <local_port> [-r <remote_ip:remote_port>] [-t <target_ip:targ
 * *测试*：
   连接本地 `127.0.0.1:9000` 或 `127.0.0.1:9001` 的 SOCKS5 端口即可实现代理上网。
 
-#### 场景 2：主动 - 被动动态学习打洞 (公网服务器与内网终端对冲)
+#### 场景 2：主动 - 被动动态学习打洞 (公网服务器与内网终端对称连接)
 * **VPS 侧** (监听本地 UDP 9000，等待接入，动态学习客户端公网 IP:Port)：
   ```bash
   ./bitun -m socks5 -p 9000 -k MySecretPSKKey123456789012345678 --odd
