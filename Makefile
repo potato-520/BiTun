@@ -1,20 +1,12 @@
-CC = gcc
-CFLAGS = -O2 -Wall -Wextra -pthread -Isrc
-LDFLAGS = -lcrypto -lpthread
+# Forwarding Makefile for BiTun project root
 
-SRCS = src/ikcp.c src/encrypt.c src/socks5.c src/tunnel.c src/main.c src/linux/bitun_osal.c
-OBJS = $(SRCS:.c=.o)
-TARGET = bitun
+.PHONY: all clean test
 
-.PHONY: all clean
-
-all: $(TARGET)
-
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+all:
+	$(MAKE) -C src/linux
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	$(MAKE) -C src/linux clean
+
+test: all
+	bash run_integration_test.sh

@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# Compile project before running tests
+make -C src/linux
+
 echo "=================================================="
 echo "Starting BiTun Integration Test..."
 echo "=================================================="
@@ -23,13 +26,13 @@ trap cleanup EXIT
 
 # 2. Start Peer A (SOCKS5 Proxy on port 9000)
 echo "[Test] Starting Peer A (SOCKS5 Proxy on port 9000)..."
-./bitun -m socks5 -p 9000 -k MySecretPSKKey123456789012345678 --odd > /tmp/peer_a.log 2>&1 &
+src/linux/bitun -m socks5 -p 9000 -k MySecretPSKKey123456789012345678 --odd > /tmp/peer_a.log 2>&1 &
 PEER_A_PID=$!
 sleep 1
 
 # 3. Start Peer B (Client worker on port 9001 connecting to Peer A on 9000)
 echo "[Test] Starting Peer B (Client worker on port 9001)..."
-./bitun -m forward_r -p 9001 -r 127.0.0.1:9000 -t 127.0.0.1:8000 -k MySecretPSKKey123456789012345678 --even > /tmp/peer_b.log 2>&1 &
+src/linux/bitun -m forward_r -p 9001 -r 127.0.0.1:9000 -t 127.0.0.1:8000 -k MySecretPSKKey123456789012345678 --even > /tmp/peer_b.log 2>&1 &
 PEER_B_PID=$!
 
 echo "[Test] Waiting for handshake to establish..."
