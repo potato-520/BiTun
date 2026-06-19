@@ -12,3 +12,9 @@ src/*.o
 .vscode/
 .idea/
 .DS_Store
+
+# ESP-IDF
+build/
+**/build/
+sdkconfig.old
+*.old

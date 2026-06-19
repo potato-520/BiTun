@@ -97,7 +97,7 @@ int bitun_osal_poll_del(bitun_osal_poll_set_t *set, bitun_socket_t fd) {
 
 int bitun_osal_poll_wait(bitun_osal_poll_set_t *set, int timeout_ms, 
                          bitun_osal_event_t *events_out, int max_events) {
-    (void)set; (timeout_ms); (events_out); (max_events);
+    (void)set; (void)timeout_ms; (void)events_out; (void)max_events;
     return -1;
 }
 

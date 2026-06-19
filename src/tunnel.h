@@ -4,7 +4,11 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <pthread.h>
+#ifdef __linux__
 #include <netinet/in.h>
+#else
+#include <sys/socket.h>
+#endif
 #include "bitun_osal.h"
 #include "encrypt.h"
 #include "socks5.h"
