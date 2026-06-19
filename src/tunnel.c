@@ -1,32 +1,23 @@
 #define _GNU_SOURCE
 #include "tunnel.h"
+#include "bitun_osal.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
-#include <pthread.h>
+#include <signal.h>
+
+extern volatile sig_atomic_t g_should_exit;
 
 #define MAX_EVENTS 1024
 #define DEFAULT_WND_SIZE 4096  /* 4KB Channel Window */
 #define BACKPRESSURE_THRES 32  /* 32 KCP Packets */
-
-/* DNS Request Context to prevent UAF during async resolution */
-typedef struct {
-    char *domain;
-    uint32_t channel_id;
-    tunnel_t *tun;
-    pthread_t thread;
-    struct sockaddr_in resolved_addr;
-    int success;
-    int done;
-} DNS_RequestContext;
 
 static int const_memcmp(const void *a, const void *b, size_t len) {
     const unsigned char *ua = a;
@@ -38,31 +29,6 @@ static int const_memcmp(const void *a, const void *b, size_t len) {
     return diff != 0;
 }
 
-/* Helper to set non-blocking on a socket */
-static int set_nonblocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) return -1;
-    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-}
-
-/* Helper to get monotonic time in milliseconds */
-static uint64_t get_time_ms(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
-/* Helper to get wall-clock time in milliseconds */
-static uint64_t get_real_time_ms(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-}
-
-/* Global array to track active DNS requests for teardown */
-static DNS_RequestContext *active_dns_reqs[MAX_CHANNELS] = {NULL};
-static pthread_mutex_t dns_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 /* KCP Output Callback - Encrypts and sends over UDP */
 static int kcp_output_cb(const char *buf, int len, ikcpcb *kcp, void *user) {
     (void)kcp;
@@ -71,7 +37,7 @@ static int kcp_output_cb(const char *buf, int len, ikcpcb *kcp, void *user) {
 
     uint64_t seq = ++tun->seq_send;
     uint8_t nonce[AEAD_NONCE_LEN];
-    uint64_t seq_be = htobe64(seq);
+    uint64_t seq_be = bitun_htobe64(seq);
     memcpy(nonce, &seq_be, 8);
     memset(nonce + 8, 0, 4);
 
@@ -94,8 +60,8 @@ static int kcp_output_cb(const char *buf, int len, ikcpcb *kcp, void *user) {
     memcpy(packet + 8, nonce, AEAD_NONCE_LEN);
     memcpy(packet + 8 + AEAD_NONCE_LEN, tag, AEAD_TAG_LEN);
 
-    sendto(tun->udp_fd, packet, out_len, 0,
-           (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
+    bitun_osal_socket_sendto(tun->udp_fd, packet, out_len, 0,
+                             (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
     free(packet);
     return 0;
 }
@@ -106,12 +72,12 @@ int tunnel_init(tunnel_t *tun, const tunnel_config_t *config) {
     tun->config = *config;
     tun->state = STATE_DISCONNECTED;
     anti_replay_init(&tun->anti_replay_win);
-    pthread_mutex_init(&tun->mutex, NULL);
+    bitun_osal_mutex_create(&tun->mutex);
     
     /* Open UDP socket */
-    tun->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    tun->udp_fd = bitun_osal_socket_create(AF_INET, SOCK_DGRAM, 0);
     if (tun->udp_fd < 0) return -1;
-    set_nonblocking(tun->udp_fd);
+    bitun_osal_socket_set_nonblocking(tun->udp_fd);
 
     memset(&tun->local_addr, 0, sizeof(tun->local_addr));
     tun->local_addr.sin_family = AF_INET;
@@ -122,8 +88,8 @@ int tunnel_init(tunnel_t *tun, const tunnel_config_t *config) {
         tun->local_addr.sin_addr.s_addr = INADDR_ANY;
     }
 
-    if (bind(tun->udp_fd, (struct sockaddr *)&tun->local_addr, sizeof(tun->local_addr)) < 0) {
-        close(tun->udp_fd);
+    if (bitun_osal_socket_bind(tun->udp_fd, (struct sockaddr *)&tun->local_addr, sizeof(tun->local_addr)) < 0) {
+        bitun_osal_socket_close(tun->udp_fd);
         return -1;
     }
 
@@ -138,39 +104,31 @@ int tunnel_init(tunnel_t *tun, const tunnel_config_t *config) {
         tun->peer_addr_valid = 0; /* Dynamic learning mode */
     }
 
-    /* Initialize Epoll */
-    tun->epoll_fd = epoll_create1(0);
-    if (tun->epoll_fd < 0) {
-        close(tun->udp_fd);
+    /* Initialize Poll Set */
+    tun->poll_set = bitun_osal_poll_create();
+    if (!tun->poll_set) {
+        bitun_osal_socket_close(tun->udp_fd);
         return -1;
     }
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = tun->udp_fd;
-    epoll_ctl(tun->epoll_fd, EPOLL_CTL_ADD, tun->udp_fd, &ev);
+    bitun_osal_poll_add(tun->poll_set, tun->udp_fd, BITUN_POLL_IN);
 
-    /* Create DNS self-pipe */
-    if (pipe(tun->dns_pipe_fd) < 0) {
-        close(tun->epoll_fd);
-        close(tun->udp_fd);
+    /* Create DNS Queue */
+    tun->dns_queue = bitun_osal_queue_create(sizeof(bitun_osal_dns_result_t), 16);
+    if (!tun->dns_queue) {
+        bitun_osal_poll_destroy(tun->poll_set);
+        bitun_osal_socket_close(tun->udp_fd);
         return -1;
     }
-    set_nonblocking(tun->dns_pipe_fd[0]);
-    set_nonblocking(tun->dns_pipe_fd[1]);
-
-    struct epoll_event dns_ev;
-    dns_ev.events = EPOLLIN;
-    dns_ev.data.fd = tun->dns_pipe_fd[0];
-    epoll_ctl(tun->epoll_fd, EPOLL_CTL_ADD, tun->dns_pipe_fd[0], &dns_ev);
+    bitun_socket_t queue_fd = bitun_osal_queue_get_read_fd(tun->dns_queue);
+    bitun_osal_poll_add(tun->poll_set, queue_fd, BITUN_POLL_IN);
 
     /* Open local TCP listener if we are forwarding locally or SOCKS5 on this side */
     if (config->mode == MODE_SOCKS5 || config->mode == MODE_FORWARD_L) {
-        tun->tcp_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        tun->tcp_listen_fd = bitun_osal_socket_create(AF_INET, SOCK_STREAM, 0);
         if (tun->tcp_listen_fd >= 0) {
-            int opt = 1;
-            setsockopt(tun->tcp_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            set_nonblocking(tun->tcp_listen_fd);
+            bitun_osal_socket_set_reuseaddr(tun->tcp_listen_fd);
+            bitun_osal_socket_set_nonblocking(tun->tcp_listen_fd);
 
             struct sockaddr_in tcp_addr;
             memset(&tcp_addr, 0, sizeof(tcp_addr));
@@ -178,27 +136,23 @@ int tunnel_init(tunnel_t *tun, const tunnel_config_t *config) {
             tcp_addr.sin_port = htons(config->local_port);
             tcp_addr.sin_addr.s_addr = INADDR_ANY;
 
-            if (bind(tun->tcp_listen_fd, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) < 0) {
+            if (bitun_osal_socket_bind(tun->tcp_listen_fd, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) < 0) {
                 perror("TCP listen bind failed");
-                close(tun->tcp_listen_fd);
-                close(tun->epoll_fd);
-                close(tun->udp_fd);
-                close(tun->dns_pipe_fd[0]);
-                close(tun->dns_pipe_fd[1]);
+                bitun_osal_socket_close(tun->tcp_listen_fd);
+                bitun_osal_queue_destroy(tun->dns_queue);
+                bitun_osal_poll_destroy(tun->poll_set);
+                bitun_osal_socket_close(tun->udp_fd);
                 return -1;
             }
-            if (listen(tun->tcp_listen_fd, 10) < 0) {
-                close(tun->tcp_listen_fd);
-                close(tun->epoll_fd);
-                close(tun->udp_fd);
-                close(tun->dns_pipe_fd[0]);
-                close(tun->dns_pipe_fd[1]);
+            if (bitun_osal_socket_listen(tun->tcp_listen_fd, 10) < 0) {
+                bitun_osal_socket_close(tun->tcp_listen_fd);
+                bitun_osal_queue_destroy(tun->dns_queue);
+                bitun_osal_poll_destroy(tun->poll_set);
+                bitun_osal_socket_close(tun->udp_fd);
                 return -1;
             }
 
-            ev.events = EPOLLIN;
-            ev.data.fd = tun->tcp_listen_fd;
-            epoll_ctl(tun->epoll_fd, EPOLL_CTL_ADD, tun->tcp_listen_fd, &ev);
+            bitun_osal_poll_add(tun->poll_set, tun->tcp_listen_fd, BITUN_POLL_IN);
         }
     } else {
         tun->tcp_listen_fd = -1;
@@ -220,20 +174,13 @@ static void close_channel(tunnel_t *tun, uint32_t channel_id) {
 
     channel_t *ch = &tun->channels[idx];
     if (ch->tcp_fd >= 0) {
-        epoll_ctl(tun->epoll_fd, EPOLL_CTL_DEL, ch->tcp_fd, NULL);
-        close(ch->tcp_fd);
+        bitun_osal_poll_del(tun->poll_set, ch->tcp_fd);
+        bitun_osal_socket_close(ch->tcp_fd);
         ch->tcp_fd = -1;
     }
     socks5_free(&ch->socks5_ctx);
     ch->is_active = 0;
     printf("[Tunnel] Channel %u closed and cleaned up.\n", channel_id);
-
-    /* Nullify any active DNS request pointers to prevent UAF */
-    pthread_mutex_lock(&dns_mutex);
-    if (active_dns_reqs[idx]) {
-        active_dns_reqs[idx]->tun = NULL; /* Detach channel pointer */
-    }
-    pthread_mutex_unlock(&dns_mutex);
 }
 
 /* Send Control Frame over KCP */
@@ -245,8 +192,8 @@ static void send_control_frame(tunnel_t *tun, uint32_t channel_id, uint8_t cmd,
     uint8_t *frame = malloc(header_len + payload_len);
     if (!frame) return;
 
-    uint32_t id_be = htobe32(channel_id);
-    uint16_t len_be = htobe16(payload_len);
+    uint32_t id_be = bitun_htobe32(channel_id);
+    uint16_t len_be = bitun_htobe16(payload_len);
 
     memcpy(frame, &id_be, 4);
     frame[4] = cmd;
@@ -261,50 +208,13 @@ static void send_control_frame(tunnel_t *tun, uint32_t channel_id, uint8_t cmd,
     free(frame);
 }
 
-/* Safe Async DNS Resolver Thread Function */
-static void *dns_resolve_thread(void *arg) {
-    DNS_RequestContext *ctx = (DNS_RequestContext *)arg;
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    printf("[DNS] Resolving %s asynchronously...\n", ctx->domain);
-    int ret = getaddrinfo(ctx->domain, NULL, &hints, &res);
-    
-    pthread_mutex_lock(&dns_mutex);
-    if (ctx->tun != NULL) {
-        dns_result_t result;
-        result.channel_id = ctx->channel_id;
-        result.success = 0;
-        memset(&result.addr, 0, sizeof(result.addr));
-        
-        if (ret == 0 && res != NULL) {
-            result.addr = *(struct sockaddr_in *)res->ai_addr;
-            result.success = 1;
-        }
-        if (write(ctx->tun->dns_pipe_fd[1], &result, sizeof(dns_result_t)) < 0) {
-            perror("[DNS] write to dns_pipe_fd failed");
-        }
-    } else {
-        printf("[DNS] Resolution finished but channel/tunnel is gone.\n");
-    }
-    pthread_mutex_unlock(&dns_mutex);
-
-    if (res) freeaddrinfo(res);
-    
-    free(ctx->domain);
-    free(ctx);
-    return NULL;
-}
-
 /* Send AUTH_RESET Frame */
 static void send_auth_reset(tunnel_t *tun) {
     if (!tun->peer_addr_valid) return;
     handshake_reset_t rst;
     memcpy(rst.magic, MSG_RESET, 4);
-    rst.timestamp = htobe64(get_real_time_ms());
-    rst.random_salt = htobe64(random());
+    rst.timestamp = bitun_htobe64(bitun_osal_time_get_real_ms());
+    rst.random_salt = bitun_htobe64(bitun_osal_random_u32());
 
     /* Signature target: magic + timestamp + salt + "BiTun Reset Request" */
     uint8_t data_to_sign[39];
@@ -315,8 +225,8 @@ static void send_auth_reset(tunnel_t *tun) {
 
     calculate_hmac(tun->config.psk, PSK_LEN, data_to_sign, sizeof(data_to_sign), rst.signature);
 
-    sendto(tun->udp_fd, &rst, sizeof(rst), 0,
-           (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
+    bitun_osal_socket_sendto(tun->udp_fd, &rst, sizeof(rst), 0,
+                             (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
     printf("[Handshake] Sent AUTH_RESET frame to Peer.\n");
 }
 
@@ -334,16 +244,6 @@ static void reset_tunnel(tunnel_t *tun) {
     tun->last_reset_timestamp = 0;
     tun->last_reset_salt = 0;
 
-    /* Clean up active DNS requests to prevent UAF or leaking */
-    pthread_mutex_lock(&dns_mutex);
-    for (int i = 0; i < MAX_CHANNELS; i++) {
-        if (active_dns_reqs[i] != NULL) {
-            active_dns_reqs[i]->tun = NULL;
-            active_dns_reqs[i] = NULL;
-        }
-    }
-    pthread_mutex_unlock(&dns_mutex);
-
     /* Close all active channels */
     for (int i = 0; i < MAX_CHANNELS; i++) {
         if (tun->channels[i].is_active) {
@@ -359,17 +259,21 @@ static void reset_tunnel(tunnel_t *tun) {
     }
 }
 
-/* Main Epoll and Tick Loop */
+/* Main Poll and Tick Loop */
 void tunnel_run(tunnel_t *tun) {
     tun->running = 1;
-    struct epoll_event events[MAX_EVENTS];
+    bitun_osal_event_t events[MAX_EVENTS];
     uint8_t read_buf[BUFFER_SIZE];
 
     printf("[Tunnel] Tunnel event loop started...\n");
     reset_tunnel(tun);
 
     while (tun->running) {
-        uint64_t now = get_time_ms();
+        if (g_should_exit) {
+            tun->running = 0;
+            break;
+        }
+        uint64_t now = bitun_osal_time_get_ms();
         uint32_t kcp_timeout = 20;
 
         if (tun->kcp) {
@@ -398,15 +302,15 @@ void tunnel_run(tunnel_t *tun) {
                 /* Send signed PING */
                 handshake_ping_pong_t ping;
                 memcpy(ping.magic, MSG_PING, 4);
-                ping.timestamp = htobe64(get_real_time_ms());
+                ping.timestamp = bitun_htobe64(bitun_osal_time_get_real_ms());
                 
                 uint8_t data[12];
                 memcpy(data, ping.magic, 4);
                 memcpy(data + 4, &ping.timestamp, 8);
                 calculate_hmac(tun->config.psk, PSK_LEN, data, 12, ping.signature);
 
-                sendto(tun->udp_fd, &ping, sizeof(ping), 0,
-                       (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
+                bitun_osal_socket_sendto(tun->udp_fd, &ping, sizeof(ping), 0,
+                                         (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
                 
                 /* Also send AUTH_RESET frame for fast reconnection support */
                 send_auth_reset(tun);
@@ -428,8 +332,8 @@ void tunnel_run(tunnel_t *tun) {
                 memcpy(data + 4, chal.random_salt, 32);
                 calculate_hmac(tun->config.psk, PSK_LEN, data, 36, chal.signature);
 
-                sendto(tun->udp_fd, &chal, sizeof(chal), 0,
-                       (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
+                bitun_osal_socket_sendto(tun->udp_fd, &chal, sizeof(chal), 0,
+                                         (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
                 tun->last_ping_time = now;
             }
         }
@@ -440,23 +344,21 @@ void tunnel_run(tunnel_t *tun) {
                 channel_t *ch = &tun->channels[idx];
                 if (ch->is_active && ch->read_suspended && ch->tcp_fd >= 0) {
                     ch->read_suspended = 0;
-                    struct epoll_event ev;
-                    ev.events = EPOLLIN | EPOLLET;
-                    ev.data.fd = ch->tcp_fd;
-                    epoll_ctl(tun->epoll_fd, EPOLL_CTL_MOD, ch->tcp_fd, &ev);
-                    printf("[Backpressure] Resumed and reactivated Epoll read for channel %u.\n", ch->channel_id);
+                    bitun_osal_poll_mod(tun->poll_set, ch->tcp_fd, BITUN_POLL_IN);
+                    printf("[Backpressure] Resumed and reactivated Poll read for channel %u.\n", ch->channel_id);
                 }
             }
         }
 
-        /* 3. Epoll I/O multiplexing */
-        int nfds = epoll_wait(tun->epoll_fd, events, MAX_EVENTS, kcp_timeout);
+        /* 3. OSAL Poll Multiplexing */
+        int nfds = bitun_osal_poll_wait(tun->poll_set, kcp_timeout, events, MAX_EVENTS);
         for (int i = 0; i < nfds; i++) {
-            int fd = events[i].data.fd;
+            bitun_socket_t fd = events[i].fd;
 
-            if (fd == tun->dns_pipe_fd[0]) {
-                dns_result_t res;
-                while (read(tun->dns_pipe_fd[0], &res, sizeof(dns_result_t)) > 0) {
+            if (fd == bitun_osal_queue_get_read_fd(tun->dns_queue)) {
+                bitun_osal_queue_clear_wakeup(tun->dns_queue);
+                bitun_osal_dns_result_t res;
+                while (bitun_osal_queue_pop(tun->dns_queue, &res) == 0) {
                     int ch_idx = -1;
                     for (int c_idx = 0; c_idx < MAX_CHANNELS; c_idx++) {
                         if (tun->channels[c_idx].is_active && tun->channels[c_idx].channel_id == res.channel_id) {
@@ -467,22 +369,42 @@ void tunnel_run(tunnel_t *tun) {
                     if (ch_idx != -1) {
                         channel_t *ch = &tun->channels[ch_idx];
                         if (res.success) {
-                            int target_fd = socket(AF_INET, SOCK_STREAM, 0);
+                            int target_fd = bitun_osal_socket_create(AF_INET, SOCK_STREAM, 0);
                             if (target_fd >= 0) {
-                                set_nonblocking(target_fd);
-                                res.addr.sin_port = htons(ch->port);
-                                printf("[DNS] Pipe handler: Connecting to target for channel %u...\n", ch->channel_id);
-                                int c_ret = connect(target_fd, (struct sockaddr *)&res.addr, sizeof(res.addr));
-                                if (c_ret == 0 || errno == EINPROGRESS) {
-                                    ch->tcp_fd = target_fd;
-                                    struct epoll_event ev;
-                                    ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                                    ev.data.fd = target_fd;
-                                    epoll_ctl(tun->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev);
+                                bitun_osal_socket_set_nonblocking(target_fd);
+                                if (res.resolved_addr) {
+                                    if (res.resolved_addr->sa_family == AF_INET) {
+                                        ((struct sockaddr_in *)res.resolved_addr)->sin_port = htons(ch->port);
+                                    } else if (res.resolved_addr->sa_family == AF_INET6) {
+                                        ((struct sockaddr_in6 *)res.resolved_addr)->sin6_port = htons(ch->port);
+                                    }
+                                    printf("[DNS] Queue handler: Connecting to target for channel %u...\n", ch->channel_id);
+                                    socklen_t addr_len = (res.resolved_addr->sa_family == AF_INET) ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+                                    int c_ret = bitun_osal_socket_connect(target_fd, res.resolved_addr, addr_len);
+                                    if (c_ret == 0 || errno == EINPROGRESS) {
+                                        ch->tcp_fd = target_fd;
+                                        bitun_osal_poll_add(tun->poll_set, target_fd, BITUN_POLL_IN | BITUN_POLL_OUT);
+                                    } else {
+                                        bitun_osal_socket_close(target_fd);
+                                        send_control_frame(tun, ch->channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
+                                        close_channel(tun, ch->channel_id);
+                                    }
                                 } else {
-                                    close(target_fd);
-                                    send_control_frame(tun, ch->channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
-                                    close_channel(tun, ch->channel_id);
+                                    struct sockaddr_in addr;
+                                    memset(&addr, 0, sizeof(addr));
+                                    addr.sin_family = AF_INET;
+                                    memcpy(&addr.sin_addr.s_addr, res.resolved_ipv4, 4);
+                                    addr.sin_port = htons(ch->port);
+                                    printf("[DNS] Queue handler (IPv4): Connecting to target for channel %u...\n", ch->channel_id);
+                                    int c_ret = bitun_osal_socket_connect(target_fd, (struct sockaddr *)&addr, sizeof(addr));
+                                    if (c_ret == 0 || errno == EINPROGRESS) {
+                                        ch->tcp_fd = target_fd;
+                                        bitun_osal_poll_add(tun->poll_set, target_fd, BITUN_POLL_IN | BITUN_POLL_OUT);
+                                    } else {
+                                        bitun_osal_socket_close(target_fd);
+                                        send_control_frame(tun, ch->channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
+                                        close_channel(tun, ch->channel_id);
+                                    }
                                 }
                             } else {
                                 send_control_frame(tun, ch->channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
@@ -493,13 +415,16 @@ void tunnel_run(tunnel_t *tun) {
                             close_channel(tun, ch->channel_id);
                         }
                     }
+                    if (res.resolved_addr) {
+                        free(res.resolved_addr);
+                    }
                 }
             } else if (fd == tun->udp_fd) {
                 /* Receive raw UDP packets */
                 struct sockaddr_in from;
-                socklen_t from_len = sizeof(from);
-                int n = recvfrom(tun->udp_fd, read_buf, BUFFER_SIZE, 0,
-                                 (struct sockaddr *)&from, &from_len);
+                bitun_socklen_t from_len = sizeof(from);
+                int n = bitun_osal_socket_recvfrom(tun->udp_fd, read_buf, BUFFER_SIZE, 0,
+                                                  (struct sockaddr *)&from, &from_len);
                 if (n <= 0) continue;
 
                 /* Handle Handshake Magics (Symmetric Packet Multiplexing) */
@@ -532,13 +457,13 @@ void tunnel_run(tunnel_t *tun) {
                             memcpy(data + 4, &pong.timestamp, 8);
                             calculate_hmac(tun->config.psk, PSK_LEN, data, 12, pong.signature);
 
-                            sendto(tun->udp_fd, &pong, sizeof(pong), 0,
-                                   (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
+                            bitun_osal_socket_sendto(tun->udp_fd, &pong, sizeof(pong), 0,
+                                                     (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
 
                             if (tun->state == STATE_DISCONNECTED || tun->state == STATE_PUNCHING) {
                                 tun->state = STATE_AUTH;
                                 /* Generate local challenge salt */
-                                for (int k = 0; k < 32; k++) tun->r_local[k] = random() & 0xFF;
+                                bitun_osal_random_bytes(tun->r_local, 32);
                                 tun->auth_start_time = now;
                                 tun->last_ping_time = 0; /* Trigger immediate AUTH_CHALLENGE */
                                 printf("[Handshake] Transitioned to STATE_AUTH.\n");
@@ -556,7 +481,7 @@ void tunnel_run(tunnel_t *tun) {
                         if (const_memcmp(sig, pong->signature, 32) == 0) {
                             if (tun->state == STATE_PUNCHING) {
                                 tun->state = STATE_AUTH;
-                                for (int k = 0; k < 32; k++) tun->r_local[k] = random() & 0xFF;
+                                bitun_osal_random_bytes(tun->r_local, 32);
                                 tun->auth_start_time = now;
                                 tun->last_ping_time = 0;
                                 printf("[Handshake] Received valid PONG. Transitioned to STATE_AUTH.\n");
@@ -585,8 +510,8 @@ void tunnel_run(tunnel_t *tun) {
                             memcpy(resp_data + 64, "BiTun Handshake Challenge", 25);
                             calculate_hmac(tun->config.psk, PSK_LEN, resp_data, sizeof(resp_data), resp.response);
 
-                            sendto(tun->udp_fd, &resp, sizeof(resp), 0,
-                                   (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
+                            bitun_osal_socket_sendto(tun->udp_fd, &resp, sizeof(resp), 0,
+                                                     (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
                         }
                         continue;
                     } else if (memcmp(magic, MSG_RESP, 4) == 0) {
@@ -624,8 +549,8 @@ void tunnel_run(tunnel_t *tun) {
                     } else if (memcmp(magic, MSG_RESET, 4) == 0) {
                         /* Handle Authenticated Reset */
                         handshake_reset_t *rst = (handshake_reset_t *)read_buf;
-                        uint64_t rst_time = be64toh(rst->timestamp);
-                        uint64_t local_time = get_real_time_ms();
+                        uint64_t rst_time = bitun_be64toh(rst->timestamp);
+                        uint64_t local_time = bitun_osal_time_get_real_ms();
                         
                         /* Timestamp window validation (±5 seconds) */
                         uint64_t diff = (local_time > rst_time) ? (local_time - rst_time) : (rst_time - local_time);
@@ -645,7 +570,7 @@ void tunnel_run(tunnel_t *tun) {
                         calculate_hmac(tun->config.psk, PSK_LEN, data_to_sign, sizeof(data_to_sign), sig);
 
                         if (const_memcmp(sig, rst->signature, 32) == 0) {
-                            uint64_t rst_salt = be64toh(rst->random_salt);
+                            uint64_t rst_salt = bitun_be64toh(rst->random_salt);
                             if (rst_time < tun->last_reset_timestamp || 
                                 (rst_time == tun->last_reset_timestamp && rst_salt == tun->last_reset_salt)) {
                                 printf("[Security] Reset frame replayed! Discarded.\n");
@@ -662,7 +587,7 @@ void tunnel_run(tunnel_t *tun) {
                             tun->peer_addr = from;
                             tun->peer_addr_valid = 1;
                             tun->state = STATE_AUTH;
-                            for (int k = 0; k < 32; k++) tun->r_local[k] = random() & 0xFF;
+                            bitun_osal_random_bytes(tun->r_local, 32);
                             tun->auth_start_time = now;
                             tun->last_ping_time = 0;
                         } else {
@@ -678,7 +603,7 @@ void tunnel_run(tunnel_t *tun) {
                     
                     uint64_t seq_be;
                     memcpy(&seq_be, read_buf, 8);
-                    uint64_t seq = be64toh(seq_be);
+                    uint64_t seq = bitun_be64toh(seq_be);
                     
                     if (!anti_replay_check(&tun->anti_replay_win, seq)) continue;
                     
@@ -688,14 +613,20 @@ void tunnel_run(tunnel_t *tun) {
                     uint8_t tag[AEAD_TAG_LEN];
                     memcpy(tag, read_buf + 8 + AEAD_NONCE_LEN, AEAD_TAG_LEN);
                     
-                    int decrypted_len = decrypt_chacha20_poly1305(tun->session_key, nonce,
-                                                                  read_buf + 8 + AEAD_NONCE_LEN + AEAD_TAG_LEN,
-                                                                  n - (8 + AEAD_NONCE_LEN + AEAD_TAG_LEN),
-                                                                  tag, read_buf);
+                    int payload_offset = 8 + AEAD_NONCE_LEN + AEAD_TAG_LEN; // 36 bytes
+                    int decrypted_len = bitun_osal_crypto_chacha20_poly1305_decrypt(
+                        tun->session_key, nonce, 
+                        read_buf + payload_offset, n - payload_offset, 
+                        tag, read_buf + payload_offset
+                    );
+                    
                     if (decrypted_len < 0) {
-                        /* Decrypt tag validation failure. Discard silently (Defect 4) */
+                        /* Decrypt tag validation failure. Discard silently */
                         continue;
                     }
+
+                    // Shift the decrypted payload back to the start of read_buf
+                    memmove(read_buf, read_buf + payload_offset, decrypted_len);
 
                     anti_replay_update(&tun->anti_replay_win, seq);
 
@@ -713,10 +644,10 @@ void tunnel_run(tunnel_t *tun) {
             } else if (fd == tun->tcp_listen_fd) {
                 /* Accept TCP connections on our listening ports */
                 struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-                int client_fd = accept(tun->tcp_listen_fd, (struct sockaddr *)&client_addr, &client_len);
+                bitun_socklen_t client_len = sizeof(client_addr);
+                int client_fd = bitun_osal_socket_accept(tun->tcp_listen_fd, (struct sockaddr *)&client_addr, &client_len);
                 if (client_fd >= 0) {
-                    set_nonblocking(client_fd);
+                    bitun_osal_socket_set_nonblocking(client_fd);
                     
                     /* Find free channel slot */
                     int free_idx = -1;
@@ -738,9 +669,7 @@ void tunnel_run(tunnel_t *tun) {
                         ch->read_suspended = 0;
                         socks5_init(&ch->socks5_ctx);
 
-                        /* Generate Channel ID. Even if client-side, Odd if server-side SOCKS5 */
-                        /* We distinguish using the local_port of the config: if local_port == client, odd, etc. */
-                        /* In PC simulator, we let the process command args define if we generate odd or even IDs */
+                        /* Generate Channel ID */
                         extern int g_is_odd_id_generator;
                         static uint32_t next_odd_id = 1;
                         static uint32_t next_even_id = 2;
@@ -752,10 +681,7 @@ void tunnel_run(tunnel_t *tun) {
                             next_even_id += 2;
                         }
 
-                        struct epoll_event client_ev;
-                        client_ev.events = EPOLLIN | EPOLLET;
-                        client_ev.data.fd = client_fd;
-                        epoll_ctl(tun->epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev);
+                        bitun_osal_poll_add(tun->poll_set, client_fd, BITUN_POLL_IN);
 
                         if (tun->config.mode == MODE_SOCKS5) {
                             /* SOCKS5 proxy: wait for handshake before triggering remote connect */
@@ -767,7 +693,7 @@ void tunnel_run(tunnel_t *tun) {
                             /* Payload: IPV4 + Target Port + IP */
                             uint8_t payload[7];
                             payload[0] = ADDR_TYPE_IPV4;
-                            uint16_t port_be = htobe16(tun->config.target_port);
+                            uint16_t port_be = bitun_htobe16(tun->config.target_port);
                             memcpy(payload + 1, &port_be, 2);
                             struct in_addr ip_addr;
                             inet_pton(AF_INET, tun->config.target_ip, &ip_addr);
@@ -776,7 +702,7 @@ void tunnel_run(tunnel_t *tun) {
                             send_control_frame(tun, ch->channel_id, CMD_CONNECT, payload, 7);
                         }
                     } else {
-                        close(client_fd);
+                        bitun_osal_socket_close(client_fd);
                     }
                 }
             } else {
@@ -792,13 +718,29 @@ void tunnel_run(tunnel_t *tun) {
                 if (ch_idx != -1) {
                     channel_t *ch = &tun->channels[ch_idx];
                     
-                    if (events[i].events & EPOLLERR) {
+                    if (events[i].events & BITUN_POLL_OUT) {
+                        int err = 0;
+                        bitun_socklen_t len = sizeof(err);
+                        if (getsockopt(events[i].fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
+                            // Connection failed
+                            send_control_frame(tun, ch->channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
+                            close_channel(tun, ch->channel_id);
+                        } else {
+                            // Connection successful
+                            send_control_frame(tun, ch->channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x00", 1);
+                            // Switch to only listen for read events, prevent write events storm
+                            bitun_osal_poll_mod(tun->poll_set, events[i].fd, BITUN_POLL_IN);
+                        }
+                        continue;
+                    }
+
+                    if (events[i].events & BITUN_POLL_ERR) {
                         close_channel(tun, ch->channel_id);
                         send_control_frame(tun, ch->channel_id, CMD_CLOSE, (uint8_t *)"\x02", 1);
                         continue;
                     }
 
-                    if (events[i].events & EPOLLIN) {
+                    if (events[i].events & BITUN_POLL_IN) {
                         if (ch->read_suspended) {
                             continue;
                         }
@@ -811,7 +753,7 @@ void tunnel_run(tunnel_t *tun) {
                             continue;
                         }
 
-                        int read_len = recv(fd, read_buf, BUFFER_SIZE, 0);
+                        int read_len = bitun_osal_socket_recv(fd, read_buf, BUFFER_SIZE, 0);
                         if (read_len > 0) {
                             if (tun->config.mode == MODE_SOCKS5 && !ch->socks5_handshake_done) {
                                 /* Parse SOCKS5 Handshake Data */
@@ -819,7 +761,7 @@ void tunnel_run(tunnel_t *tun) {
                                 size_t resp_len = 0;
                                 int res = socks5_handle_input(&ch->socks5_ctx, read_buf, read_len, resp, &resp_len);
                                 if (resp_len > 0) {
-                                    send(fd, resp, resp_len, 0);
+                                    bitun_osal_socket_send(fd, resp, resp_len, 0);
                                 }
                                 if (res == 1) {
                                     /* SOCKS5 Target address parsed successfully! Initiate target connection */
@@ -828,7 +770,7 @@ void tunnel_run(tunnel_t *tun) {
                                     
                                     /* Build CONNECT Frame to send to remote VPS endpoint */
                                     uint8_t payload[512];
-                                    uint16_t port_be = htobe16(ch->port);
+                                    uint16_t port_be = bitun_htobe16(ch->port);
                                     
                                     if (ch->socks5_ctx.addr_type == 0x01) { // IPv4
                                         payload[0] = ADDR_TYPE_IPV4;
@@ -855,9 +797,7 @@ void tunnel_run(tunnel_t *tun) {
                                 }
                             } else {
                                 /* Standard Data Forwarding over KCP */
-                                /* Flow Control (Defect 5): Check Channel Window Size */
                                 int to_read = (read_len > (int)ch->send_wnd) ? (int)ch->send_wnd : read_len;
-                                /* Quota check (Defect 2): Limit single read size to 2KB */
                                 if (to_read > 2048) to_read = 2048;
 
                                 if (to_read > 0) {
@@ -884,11 +824,11 @@ void tunnel_run(tunnel_t *tun) {
                 
                 uint32_t channel_id_be;
                 memcpy(&channel_id_be, kcp_buf, 4);
-                uint32_t channel_id = be32toh(channel_id_be);
+                uint32_t channel_id = bitun_be32toh(channel_id_be);
                 uint8_t cmd = kcp_buf[4];
                 uint16_t payload_len_be;
                 memcpy(&payload_len_be, kcp_buf + 6, 2);
-                uint16_t payload_len = be16toh(payload_len_be);
+                uint16_t payload_len = bitun_be16toh(payload_len_be);
                 uint8_t *payload = (uint8_t *)kcp_buf + 8;
 
                 if (cmd == CMD_KEEPALIVE) {
@@ -930,7 +870,7 @@ void tunnel_run(tunnel_t *tun) {
                         uint8_t addr_type = payload[0];
                         uint16_t target_port_be;
                         memcpy(&target_port_be, payload + 1, 2);
-                        uint16_t target_port = be16toh(target_port_be);
+                        uint16_t target_port = bitun_be16toh(target_port_be);
                         ch->port = target_port;
 
                         if (addr_type == ADDR_TYPE_SOCKS5) {
@@ -947,21 +887,18 @@ void tunnel_run(tunnel_t *tun) {
                                 target_addr.sin_port = htons(target_port);
                                 memcpy(&target_addr.sin_addr.s_addr, payload + 3, 4);
 
-                                int target_fd = socket(AF_INET, SOCK_STREAM, 0);
+                                int target_fd = bitun_osal_socket_create(AF_INET, SOCK_STREAM, 0);
                                 if (target_fd >= 0) {
-                                    set_nonblocking(target_fd);
+                                    bitun_osal_socket_set_nonblocking(target_fd);
                                     printf("[Forward-R] Connecting to target IPv4 %s:%d...\n",
                                            inet_ntoa(target_addr.sin_addr), target_port);
                                     
-                                    int c_ret = connect(target_fd, (struct sockaddr *)&target_addr, sizeof(target_addr));
+                                    int c_ret = bitun_osal_socket_connect(target_fd, (struct sockaddr *)&target_addr, sizeof(target_addr));
                                     if (c_ret == 0 || errno == EINPROGRESS) {
                                         ch->tcp_fd = target_fd;
-                                        struct epoll_event ev;
-                                        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                                        ev.data.fd = target_fd;
-                                        epoll_ctl(tun->epoll_fd, EPOLL_CTL_ADD, target_fd, &ev);
+                                        bitun_osal_poll_add(tun->poll_set, target_fd, BITUN_POLL_IN | BITUN_POLL_OUT);
                                     } else {
-                                        close(target_fd);
+                                        bitun_osal_socket_close(target_fd);
                                         send_control_frame(tun, channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
                                         close_channel(tun, channel_id);
                                     }
@@ -972,23 +909,13 @@ void tunnel_run(tunnel_t *tun) {
                             } else if (addr_type == ADDR_TYPE_DOMAIN) {
                                 uint8_t dom_len = payload[3];
                                 char *domain = malloc(dom_len + 1);
-                                memcpy(domain, payload + 4, dom_len);
-                                domain[dom_len] = '\0';
-
-                                /* Trigger Asynchronous Safe DNS Resolution to avoid blocking loop */
-                                DNS_RequestContext *dns_ctx = malloc(sizeof(DNS_RequestContext));
-                                dns_ctx->domain = domain;
-                                dns_ctx->channel_id = channel_id;
-                                dns_ctx->tun = tun;
-                                dns_ctx->success = 0;
-                                dns_ctx->done = 0;
-
-                                pthread_mutex_lock(&dns_mutex);
-                                active_dns_reqs[free_idx] = dns_ctx;
-                                pthread_mutex_unlock(&dns_mutex);
-
-                                pthread_create(&dns_ctx->thread, NULL, dns_resolve_thread, dns_ctx);
-                                pthread_detach(dns_ctx->thread);
+                                if (domain) {
+                                    memcpy(domain, payload + 4, dom_len);
+                                    domain[dom_len] = '\0';
+                                    printf("[DNS] Dispatching async resolution for domain: %s\n", domain);
+                                    bitun_osal_dns_resolve_async(domain, channel_id, tun->dns_queue);
+                                    free(domain);
+                                }
                             }
                         }
                     } else {
@@ -1002,24 +929,27 @@ void tunnel_run(tunnel_t *tun) {
                         if (status == 0x00) {
                             printf("[Channel] Channel %u Target connected successfully!\n", channel_id);
                             ch->socks5_handshake_done = 1;
-                            
-                            /* Ensure epoll checks read events since connection is now active */
-                            struct epoll_event ev;
-                            ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                            ev.data.fd = ch->tcp_fd;
-                            epoll_ctl(tun->epoll_fd, EPOLL_CTL_MOD, ch->tcp_fd, &ev);
+                            if (tun->config.mode == MODE_SOCKS5) {
+                                uint8_t socks5_resp[10] = {0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+                                bitun_osal_socket_send(ch->tcp_fd, socks5_resp, 10, 0);
+                            }
+                            bitun_osal_poll_add(tun->poll_set, ch->tcp_fd, BITUN_POLL_IN);
                         } else {
                             printf("[Channel] Channel %u target connection refused.\n", channel_id);
+                            if (tun->config.mode == MODE_SOCKS5) {
+                                uint8_t socks5_resp[10] = {0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+                                bitun_osal_socket_send(ch->tcp_fd, socks5_resp, 10, 0);
+                            }
                             close_channel(tun, channel_id);
                         }
                     } else if (cmd == CMD_DATA) {
                         if (ch->tcp_fd >= 0) {
-                            int sent = send(ch->tcp_fd, payload, payload_len, 0);
+                            int sent = bitun_osal_socket_send(ch->tcp_fd, payload, payload_len, 0);
                             if (sent > 0) {
                                 ch->local_recv_accum += sent;
                                 /* Window update trigger: if consumed 2KB, report update */
                                 if (ch->local_recv_accum >= 2048) {
-                                    uint32_t accum_be = htobe32(ch->local_recv_accum);
+                                    uint32_t accum_be = bitun_htobe32(ch->local_recv_accum);
                                     send_control_frame(tun, channel_id, CMD_WINDOW_UPDATE, (uint8_t *)&accum_be, 4);
                                     ch->local_recv_accum = 0;
                                 }
@@ -1030,13 +960,12 @@ void tunnel_run(tunnel_t *tun) {
                     } else if (cmd == CMD_WINDOW_UPDATE) {
                         uint32_t window_inc;
                         memcpy(&window_inc, payload, 4);
-                        ch->send_wnd += be32toh(window_inc);
+                        ch->send_wnd += bitun_be32toh(window_inc);
                         
                         /* Resume reading if it was suspended */
-                        struct epoll_event ev;
-                        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
-                        ev.data.fd = ch->tcp_fd;
-                        epoll_ctl(tun->epoll_fd, EPOLL_CTL_MOD, ch->tcp_fd, &ev);
+                        if (ch->tcp_fd >= 0) {
+                            bitun_osal_poll_mod(tun->poll_set, ch->tcp_fd, BITUN_POLL_IN);
+                        }
                     }
                 }
             }
@@ -1047,14 +976,25 @@ void tunnel_run(tunnel_t *tun) {
 /* Destroy Tunnel */
 void tunnel_destroy(tunnel_t *tun) {
     tun->running = 0;
-    pthread_mutex_lock(&tun->mutex);
+    bitun_osal_mutex_lock(tun->mutex);
     reset_tunnel(tun);
-    if (tun->udp_fd >= 0) close(tun->udp_fd);
-    if (tun->tcp_listen_fd >= 0) close(tun->tcp_listen_fd);
-    close(tun->epoll_fd);
-    close(tun->dns_pipe_fd[0]);
-    close(tun->dns_pipe_fd[1]);
-    pthread_mutex_unlock(&tun->mutex);
-    pthread_mutex_destroy(&tun->mutex);
+    if (tun->udp_fd >= 0) bitun_osal_socket_close(tun->udp_fd);
+    if (tun->tcp_listen_fd >= 0) bitun_osal_socket_close(tun->tcp_listen_fd);
+    if (tun->poll_set) {
+        bitun_osal_poll_destroy(tun->poll_set);
+        tun->poll_set = NULL;
+    }
+    if (tun->dns_queue) {
+        bitun_osal_dns_result_t res;
+        while (bitun_osal_queue_pop(tun->dns_queue, &res) == 0) {
+            if (res.resolved_addr) {
+                free(res.resolved_addr);
+            }
+        }
+        bitun_osal_queue_destroy(tun->dns_queue);
+        tun->dns_queue = NULL;
+    }
+    bitun_osal_mutex_unlock(tun->mutex);
+    bitun_osal_mutex_destroy(tun->mutex);
     printf("[Tunnel] Destroyed.\n");
 }

@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <pthread.h>
 #include <netinet/in.h>
+#include "bitun_osal.h"
 #include "encrypt.h"
 #include "socks5.h"
 #include "ikcp.h"
@@ -54,11 +55,7 @@ typedef struct {
     uint8_t psk[PSK_LEN];
 } tunnel_config_t;
 
-typedef struct {
-    uint32_t channel_id;
-    struct sockaddr_in addr;
-    int success;
-} dns_result_t;
+// dns_result_t is replaced by bitun_osal_dns_result_t from bitun_osal.h
 
 /* Global Tunnel Context */
 typedef struct {
@@ -80,7 +77,7 @@ typedef struct {
     ikcpcb *kcp;
     
     channel_t channels[MAX_CHANNELS];
-    int epoll_fd;
+    bitun_osal_poll_set_t *poll_set;
     int tcp_listen_fd;
     
     uint64_t last_recv_time;
@@ -88,11 +85,11 @@ typedef struct {
     uint64_t last_ping_time;
     uint64_t auth_start_time;
     
-    pthread_mutex_t mutex;
+    bitun_osal_mutex_t *mutex;
     pthread_t thread_id;
     int running;
 
-    int dns_pipe_fd[2];
+    bitun_osal_queue_t *dns_queue;
     uint64_t last_reset_timestamp;
     uint64_t last_reset_salt;
 } tunnel_t;

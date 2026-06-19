@@ -3,17 +3,17 @@
 #include <string.h>
 #include <signal.h>
 #include "tunnel.h"
+#include "bitun_osal.h"
 
 /* Global odd/even ID generator flag */
 int g_is_odd_id_generator = 0;
 
 static tunnel_t g_tun;
+volatile sig_atomic_t g_should_exit = 0;
 
 static void handle_signal(int sig) {
     (void)sig;
-    printf("\n[Main] Terminating tunnel...\n");
-    tunnel_destroy(&g_tun);
-    exit(0);
+    g_should_exit = 1;
 }
 
 static void print_usage(const char *prog) {
@@ -140,14 +140,18 @@ int main(int argc, char **argv) {
            config.mode == MODE_SOCKS5 ? "socks5" : (config.mode == MODE_FORWARD_L ? "forward_l" : "forward_r"),
            g_is_odd_id_generator ? "ODD" : "EVEN");
 
+    bitun_osal_dns_init();
+
     if (tunnel_init(&g_tun, &config) < 0) {
         fprintf(stderr, "Error: Tunnel initialization failed.\n");
+        bitun_osal_dns_deinit();
         return 1;
     }
 
     /* Block and run event loop */
     tunnel_run(&g_tun);
 
+    bitun_osal_dns_deinit();
     tunnel_destroy(&g_tun);
     return 0;
 }

@@ -2,7 +2,7 @@ CC = gcc
 CFLAGS = -O2 -Wall -Wextra -pthread -Isrc
 LDFLAGS = -lcrypto -lpthread
 
-SRCS = src/ikcp.c src/encrypt.c src/socks5.c src/tunnel.c src/main.c
+SRCS = src/ikcp.c src/encrypt.c src/socks5.c src/tunnel.c src/main.c src/linux/bitun_osal.c
 OBJS = $(SRCS:.c=.o)
 TARGET = bitun
 
