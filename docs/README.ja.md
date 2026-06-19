@@ -125,17 +125,32 @@ flowchart LR
 ├── LICENSE             # オープンソースライセンス (Apache 2.0)
 ├── Makefile            # ビルドスクリプト
 ├── README.md           # 中国語メイン README
+├── run_integration_test.sh # 一括統合テストスクリプト
 ├── docs/               # ドキュメントディレクトリ
 │   ├── README.en.md    # 英語 README
 │   ├── README.ja.md    # 日本語 README (このドキュメント)
 │   ├── design.md       # システム設計仕様書
-│   └── verification_report.md # 整合性およびテスト検証レポート
+│   ├── verification_report.md # 整合性およびテスト検証レポート
+│   ├── bitun_osal_design.md   # OSAL設計仕様書
+│   ├── final_osal_spec.md     # OSAL API規格書
+│   ├── task_plan.md           # プロジェクトタスク計画書
+│   ├── dependence_analysis.md # 依存性分析レポート
+│   ├── adversarial_report.md  # 敵対的テストレポート
+│   ├── audit_report.md        # コード監査レポート
+│   ├── implementation_task_plan.md           # 実装タスク計画書
+│   ├── implementation_submission.md          # 実装提出説明書
+│   ├── implementation_adversarial_report.md  # 実装敵対的テストレポート
+│   └── implementation_audit_report.md        # 実装監査レポート
 └── src/                # ソースコードディレクトリ
+    ├── bitun_osal.h    # 統一OS抽象化レイヤー（OSAL）インターフェース
     ├── encrypt.c/h     # AEAD暗号化、HKDF、リプレイ防御スライディングウィンドウ
     ├── ikcp.c/h        # KCPプロトコルコアコード
     ├── socks5.c/h      # ステートレスなストリーミングSOCKS5パーサー
     ├── tunnel.c/h      # 対称トンネル状態マシン、イベント、多重化、バックプレッシャー
-    └── main.c          # CLIエントリおよび設定パーサー
+    ├── main.c          # CLIエントリおよび設定パーサー
+    └── linux/          # Linuxプラットフォーム実装
+        ├── bitun_osal.c # Linux用OSAL実装
+        └── test_bitun_osal.c # OSALユニットテストスイート
 ```
 
 ---
@@ -157,6 +172,24 @@ make
 ### クリーンアップ
 ```bash
 make clean
+```
+
+---
+
+## 🧪 テストと検証
+
+### OSALユニットテストのコンパイルと実行
+プロジェクトのルートディレクトリで、以下のコマンドを実行してOS抽象化レイヤー（OSAL）のユニットテストをビルドおよび実行します：
+```bash
+gcc -O2 -Wall -Wextra -pthread -Isrc -o test_bitun_osal src/linux/test_bitun_osal.c src/linux/bitun_osal.c -lcrypto -lpthread
+./test_bitun_osal
+rm test_bitun_osal
+```
+
+### システム統合テストの実行
+プロジェクトのルートディレクトリで、以下のコマンドを実行して一括統合テストを実行します：
+```bash
+bash run_integration_test.sh
 ```
 
 ---

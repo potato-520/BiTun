@@ -124,17 +124,32 @@ flowchart LR
 ├── LICENSE             # 开源许可证 (Apache 2.0)
 ├── Makefile            # 构建脚本
 ├── README.md           # 中文 README (本文档)
+├── run_integration_test.sh # 一键集成测试脚本
 ├── docs/               # 文档目录
 │   ├── README.en.md    # 英文版 README
 │   ├── README.ja.md    # 日文版 README
 │   ├── design.md       # 系统设计说明书
-│   └── verification_report.md # 一致性与测试验证报告
+│   ├── verification_report.md # 一致性与测试验证报告
+│   ├── bitun_osal_design.md   # OSAL 设计说明书
+│   ├── final_osal_spec.md     # OSAL 接口规格说明书
+│   ├── task_plan.md           # 任务规划书
+│   ├── dependence_analysis.md # 依赖分析报告
+│   ├── adversarial_report.md  # 对抗性测试报告
+│   ├── audit_report.md        # 审计报告
+│   ├── implementation_task_plan.md           # 实现任务规划书
+│   ├── implementation_submission.md          # 实现提交说明
+│   ├── implementation_adversarial_report.md  # 实现对抗性测试报告
+│   └── implementation_audit_report.md        # 实现审计报告
 └── src/                # 源码目录
+    ├── bitun_osal.h    # 跨平台统一操作系统抽象层接口
     ├── encrypt.c/h     # AEAD 加密、HKDF、防重放滑动窗口实现
     ├── ikcp.c/h        # KCP 协议核心源码
     ├── socks5.c/h      # 流式无状态 SOCKS5 协议解析器
     ├── tunnel.c/h      # 对称隧道状态机、事件循环、多路复用与流控
-    └── main.c          # 命令行入口及配置解析
+    ├── main.c          # 命令行入口及配置解析
+    └── linux/          # Linux 平台具体实现
+        ├── bitun_osal.c # Linux 平台具体实现
+        └── test_bitun_osal.c # OSAL 单元测试用例
 ```
 
 ---
@@ -156,6 +171,24 @@ make
 ### 清理编译
 ```bash
 make clean
+```
+
+---
+
+## 🧪 测试与验证
+
+### 编译与运行 OSAL 单元测试
+在项目根目录下，执行以下命令编译并运行操作系统抽象层（OSAL）的单元测试：
+```bash
+gcc -O2 -Wall -Wextra -pthread -Isrc -o test_bitun_osal src/linux/test_bitun_osal.c src/linux/bitun_osal.c -lcrypto -lpthread
+./test_bitun_osal
+rm test_bitun_osal
+```
+
+### 运行系统集成测试
+在项目根目录下，执行以下命令运行完整的一键集成测试：
+```bash
+bash run_integration_test.sh
 ```
 
 ---

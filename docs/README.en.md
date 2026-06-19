@@ -126,17 +126,32 @@ flowchart LR
 ├── LICENSE             # Open source license (Apache 2.0)
 ├── Makefile            # Build script
 ├── README.md           # Chinese README
+├── run_integration_test.sh # One-click integration test script
 ├── docs/               # Documentation directory
 │   ├── README.en.md    # English README (This document)
 │   ├── README.ja.md    # Japanese README
 │   ├── design.md       # System Design Specification
-│   └── verification_report.md # Verification & Testing Report
+│   ├── verification_report.md # Verification & Testing Report
+│   ├── bitun_osal_design.md   # OSAL Design Specification
+│   ├── final_osal_spec.md     # OSAL API Specification
+│   ├── task_plan.md           # Project Task Plan
+│   ├── dependence_analysis.md # Dependency Analysis Report
+│   ├── adversarial_report.md  # Adversarial Testing Report
+│   ├── audit_report.md        # Code Audit Report
+│   ├── implementation_task_plan.md           # Implementation Task Plan
+│   ├── implementation_submission.md          # Implementation Submission Notes
+│   ├── implementation_adversarial_report.md  # Implementation Adversarial Report
+│   └── implementation_audit_report.md        # Implementation Audit Report
 └── src/                # Source code directory
+    ├── bitun_osal.h    # Cross-platform OSAL interface
     ├── encrypt.c/h     # AEAD encryption, HKDF, anti-replay sliding window
     ├── ikcp.c/h        # Core KCP protocol
     ├── socks5.c/h      # Stateless streaming SOCKS5 parser
     ├── tunnel.c/h      # Symmetric tunnel state machine, events, multiplexing, backpressure
-    └── main.c          # CLI entry and config parser
+    ├── main.c          # CLI entry and config parser
+    └── linux/          # Linux platform implementation
+        ├── bitun_osal.c # Linux platform OSAL implementation
+        └── test_bitun_osal.c # OSAL unit test suite
 ```
 
 ---
@@ -158,6 +173,24 @@ This generates the binary `bitun` in the root folder.
 ### Clean Command
 ```bash
 make clean
+```
+
+---
+
+## 🧪 Testing & Verification
+
+### Compile & Run OSAL Unit Tests
+In the project root directory, run the following commands to compile and execute the Operating System Abstraction Layer (OSAL) unit tests:
+```bash
+gcc -O2 -Wall -Wextra -pthread -Isrc -o test_bitun_osal src/linux/test_bitun_osal.c src/linux/bitun_osal.c -lcrypto -lpthread
+./test_bitun_osal
+rm test_bitun_osal
+```
+
+### Run System Integration Tests
+In the project root directory, run the following command to execute the one-click system integration test:
+```bash
+bash run_integration_test.sh
 ```
 
 ---
