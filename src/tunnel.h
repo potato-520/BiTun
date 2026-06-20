@@ -13,6 +13,7 @@
 #include "encrypt.h"
 #include "socks5.h"
 #include "ikcp.h"
+#include "fec.h"
 
 #define MAX_CHANNELS 256
 #define BUFFER_SIZE 65536
@@ -88,6 +89,18 @@ typedef struct {
     bitun_osal_queue_t *dns_queue;
     uint64_t last_reset_timestamp;
     uint64_t last_reset_salt;
+
+    /* FEC States and Config */
+    fec_encoder_t fec_enc;
+    fec_decoder_t fec_dec;
+    uint8_t fec_n;
+    uint8_t fec_r;
+
+    /* FEC Loss Statistics */
+    uint32_t stats_expected_groups;
+    uint32_t stats_received_packets;
+    uint32_t stats_group_packet_count;
+    uint64_t last_stats_report_time;
 } tunnel_t;
 
 /* Protocol Commands (Cmd Type) */
@@ -97,6 +110,7 @@ typedef struct {
 #define CMD_CLOSE          0x04
 #define CMD_KEEPALIVE      0x05
 #define CMD_WINDOW_UPDATE  0x06
+#define CMD_FEC_FEEDBACK   0x07
 
 /* Address Type in CMD_CONNECT */
 #define ADDR_TYPE_IPV4    0x01

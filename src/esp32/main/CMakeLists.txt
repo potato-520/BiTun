@@ -6,6 +6,7 @@ idf_component_register(SRCS "../main.c"
                             "../../encrypt.c"
                             "../../socks5.c"
                             "../../tunnel.c"
+                            "../../fec.c"
                        INCLUDE_DIRS "../" "../../"
                        REQUIRES lwip mbedtls)
 

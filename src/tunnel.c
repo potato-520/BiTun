@@ -29,10 +29,7 @@ static int const_memcmp(const void *a, const void *b, size_t len) {
     return diff != 0;
 }
 
-/* KCP Output Callback - Encrypts and sends over UDP */
-static int kcp_output_cb(const char *buf, int len, ikcpcb *kcp, void *user) {
-    (void)kcp;
-    tunnel_t *tun = (tunnel_t *)user;
+static int encrypt_and_send_udp(tunnel_t *tun, const fec_header_t *hdr, const uint8_t *payload, int payload_len) {
     if (!tun->peer_addr_valid) return 0;
 
     uint64_t seq = ++tun->seq_send;
@@ -41,18 +38,22 @@ static int kcp_output_cb(const char *buf, int len, ikcpcb *kcp, void *user) {
     memcpy(nonce, &seq_be, 8);
     memset(nonce + 8, 0, 4);
 
-    /* Packet layout: [Seq (8B)] [Nonce (12B)] [Tag (16B)] [Ciphertext (len B)] */
-    int out_len = 8 + AEAD_NONCE_LEN + AEAD_TAG_LEN + len;
-    uint8_t *packet = malloc(out_len);
-    if (!packet) return -1;
+    int total_payload_len = 6 + payload_len;
+    int out_len = 8 + AEAD_NONCE_LEN + AEAD_TAG_LEN + total_payload_len;
+
+    uint8_t packet[1500];
+    uint8_t raw_payload[1420];
+    if (total_payload_len > 1414 || out_len > 1500) return -1;
+
+    memcpy(raw_payload, hdr, 6);
+    memcpy(raw_payload + 6, payload, payload_len);
 
     uint8_t tag[AEAD_TAG_LEN];
     int ciphertext_len = encrypt_chacha20_poly1305(tun->session_key, nonce,
-                                                   (const uint8_t *)buf, len,
+                                                   raw_payload, total_payload_len,
                                                    packet + 8 + AEAD_NONCE_LEN + AEAD_TAG_LEN,
                                                    tag);
     if (ciphertext_len < 0) {
-        free(packet);
         return -1;
     }
 
@@ -62,8 +63,238 @@ static int kcp_output_cb(const char *buf, int len, ikcpcb *kcp, void *user) {
 
     bitun_osal_socket_sendto(tun->udp_fd, packet, out_len, 0,
                              (struct sockaddr *)&tun->peer_addr, sizeof(tun->peer_addr));
-    free(packet);
     return 0;
+}
+
+static void send_parity_packets(tunnel_t *tun) {
+    int n = tun->fec_enc.data_packet_count;
+    int r = tun->fec_enc.r;
+    if (r <= 0 || n == 0) {
+        tun->fec_enc.data_packet_count = 0;
+        return;
+    }
+
+    uint8_t *data_ptrs[FEC_MAX_N];
+    for (int i = 0; i < n; i++) {
+        data_ptrs[i] = tun->fec_enc.data_blocks[i];
+    }
+
+    uint8_t *parity_ptrs[FEC_MAX_R];
+    for (int i = 0; i < r; i++) {
+        parity_ptrs[i] = tun->fec_enc.parity_blocks[i];
+    }
+
+    fec_encode(data_ptrs, n, r, FEC_BLOCK_SIZE, parity_ptrs);
+
+    for (int i = 0; i < r; i++) {
+        fec_header_t hdr;
+        hdr.group_id = bitun_htobe16(tun->fec_enc.current_group_id);
+        hdr.index = n + i;
+        hdr.n = n;
+        hdr.r = r;
+        hdr.reserved = 0;
+
+        encrypt_and_send_udp(tun, &hdr, tun->fec_enc.parity_blocks[i], FEC_BLOCK_SIZE);
+    }
+
+    tun->fec_enc.data_packet_count = 0;
+}
+
+static void handle_incoming_fec_packet(tunnel_t *tun, const fec_header_t *hdr, const uint8_t *payload, int payload_len, uint64_t now);
+static void send_control_frame(tunnel_t *tun, uint32_t channel_id, uint8_t cmd,
+                               const uint8_t *payload, uint16_t payload_len);
+
+/* KCP Output Callback - Encrypts and sends over UDP */
+static int kcp_output_cb(const char *buf, int len, ikcpcb *kcp, void *user) {
+    (void)kcp;
+    tunnel_t *tun = (tunnel_t *)user;
+    if (!tun->peer_addr_valid) return 0;
+
+    if (tun->fec_r == 0) {
+        fec_header_t hdr;
+        hdr.group_id = 0;
+        hdr.index = 0;
+        hdr.n = 1;
+        hdr.r = 0;
+        hdr.reserved = 0;
+        return encrypt_and_send_udp(tun, &hdr, (const uint8_t *)buf, len);
+    }
+
+    int idx = tun->fec_enc.data_packet_count;
+    if (idx == 0) {
+        tun->fec_enc.n = tun->fec_n;
+        if (tun->fec_enc.n > FEC_MAX_N) tun->fec_enc.n = FEC_MAX_N;
+        if (tun->fec_enc.n == 0) tun->fec_enc.n = 1;
+        tun->fec_enc.r = tun->fec_r;
+        if (tun->fec_enc.r > FEC_MAX_R) tun->fec_enc.r = FEC_MAX_R;
+        tun->fec_enc.current_group_id++;
+        tun->fec_enc.last_packet_time = bitun_osal_time_get_real_ms();
+    }
+
+    tun->fec_enc.data_lengths[idx] = len;
+    uint16_t len_be = bitun_htobe16(len);
+    memcpy(tun->fec_enc.data_blocks[idx], &len_be, 2);
+    memcpy(tun->fec_enc.data_blocks[idx] + 2, buf, len);
+    if (FEC_BLOCK_SIZE > 2 + len) {
+        memset(tun->fec_enc.data_blocks[idx] + 2 + len, 0, FEC_BLOCK_SIZE - 2 - len);
+    }
+
+    fec_header_t hdr;
+    hdr.group_id = bitun_htobe16(tun->fec_enc.current_group_id);
+    hdr.index = idx;
+    hdr.n = tun->fec_enc.n;
+    hdr.r = tun->fec_enc.r;
+    hdr.reserved = 0;
+
+    encrypt_and_send_udp(tun, &hdr, (const uint8_t *)buf, len);
+
+    tun->fec_enc.data_packet_count++;
+
+    if (tun->fec_enc.data_packet_count >= tun->fec_enc.n) {
+        send_parity_packets(tun);
+    }
+    return 0;
+}
+
+static void handle_incoming_fec_packet(tunnel_t *tun, const fec_header_t *hdr, const uint8_t *payload, int payload_len, uint64_t now) {
+    uint16_t group_id = bitun_be16toh(hdr->group_id);
+    uint8_t index = hdr->index;
+    uint8_t n = hdr->n;
+    uint8_t r = hdr->r;
+
+    if (n > FEC_MAX_N || r > FEC_MAX_R || n == 0) return;
+
+    if (r == 0) {
+        ikcp_input(tun->kcp, (const char *)payload, payload_len);
+        return;
+    }
+
+    fec_group_t *group = NULL;
+    for (int i = 0; i < FEC_MAX_GROUPS; i++) {
+        if (tun->fec_dec.groups[i].received_count > 0 && tun->fec_dec.groups[i].group_id == group_id) {
+            group = &tun->fec_dec.groups[i];
+            break;
+        }
+    }
+
+    if (!group) {
+        int best_slot = -1;
+        uint64_t oldest_time = (uint64_t)-1;
+        for (int i = 0; i < FEC_MAX_GROUPS; i++) {
+            if (tun->fec_dec.groups[i].received_count == 0) {
+                best_slot = i;
+                break;
+            }
+            if (tun->fec_dec.groups[i].last_active_time < oldest_time) {
+                oldest_time = tun->fec_dec.groups[i].last_active_time;
+                best_slot = i;
+            }
+        }
+        if (best_slot == -1) return;
+        group = &tun->fec_dec.groups[best_slot];
+
+        memset(group, 0, sizeof(fec_group_t));
+        group->group_id = group_id;
+        group->n = n;
+        group->r = r;
+        tun->stats_expected_groups += (n + r);
+    }
+
+    group->last_active_time = now;
+
+    if (index >= n + r) return;
+    if (group->has_index[index]) return;
+
+    tun->stats_received_packets++;
+    tun->stats_group_packet_count++;
+
+    group->has_index[index] = 1;
+    group->received_indices[group->received_count] = index;
+
+    if (index < n) {
+        uint16_t len_be = bitun_htobe16(payload_len);
+        memcpy(group->received_blocks[group->received_count], &len_be, 2);
+        memcpy(group->received_blocks[group->received_count] + 2, payload, payload_len);
+        if (FEC_BLOCK_SIZE > 2 + payload_len) {
+            memset(group->received_blocks[group->received_count] + 2 + payload_len, 0, FEC_BLOCK_SIZE - 2 - payload_len);
+        }
+
+        ikcp_input(tun->kcp, (const char *)payload, payload_len);
+    } else {
+        if (payload_len >= FEC_BLOCK_SIZE) {
+            memcpy(group->received_blocks[group->received_count], payload, FEC_BLOCK_SIZE);
+        } else {
+            memcpy(group->received_blocks[group->received_count], payload, payload_len);
+            memset(group->received_blocks[group->received_count] + payload_len, 0, FEC_BLOCK_SIZE - payload_len);
+        }
+    }
+
+    group->received_count++;
+
+    if (!group->decoded && group->received_count >= n) {
+        int missing_data_count = 0;
+        for (int i = 0; i < n; i++) {
+            if (!group->has_index[i]) {
+                missing_data_count++;
+            }
+        }
+
+        if (missing_data_count > 0) {
+            uint8_t *recv_ptrs[FEC_MAX_N + FEC_MAX_R];
+            for (int i = 0; i < group->received_count; i++) {
+                recv_ptrs[i] = group->received_blocks[i];
+            }
+
+            uint8_t *recovered_ptrs[FEC_MAX_N];
+            for (int i = 0; i < n; i++) {
+                recovered_ptrs[i] = tun->fec_dec.recovered_data[i];
+            }
+
+            int ret = fec_decode(recv_ptrs, group->received_indices, group->received_count, n, r, FEC_BLOCK_SIZE, recovered_ptrs);
+            if (ret == 0) {
+                for (int i = 0; i < n; i++) {
+                    if (!group->has_index[i]) {
+                        uint16_t len_be;
+                        memcpy(&len_be, tun->fec_dec.recovered_data[i], 2);
+                        uint16_t orig_len = bitun_be16toh(len_be);
+                        if (orig_len > 0 && orig_len <= KCP_MTU) {
+                            ikcp_input(tun->kcp, (const char *)(tun->fec_dec.recovered_data[i] + 2), orig_len);
+                            printf("[FEC] Successfully reconstructed lost packet group_id=%d index=%d len=%d\n", group_id, i, orig_len);
+                        }
+                    }
+                }
+                group->decoded = 1;
+            } else {
+                printf("[FEC] Failed decoding group_id=%d\n", group_id);
+            }
+        } else {
+            group->decoded = 1;
+        }
+    }
+
+    uint64_t now_ms = bitun_osal_time_get_real_ms();
+    if (tun->stats_group_packet_count >= 100 || (now_ms - tun->last_stats_report_time >= 1000)) {
+        if (tun->stats_expected_groups > 0) {
+            uint32_t expected = tun->stats_expected_groups;
+            uint32_t received = tun->stats_received_packets;
+            uint8_t loss_rate = 0;
+            if (expected > received) {
+                loss_rate = (uint8_t)(((uint64_t)(expected - received) * 100) / expected);
+            }
+            if (loss_rate > 100) loss_rate = 100;
+
+            send_control_frame(tun, 0, CMD_FEC_FEEDBACK, &loss_rate, 1);
+
+            tun->stats_expected_groups = 0;
+            tun->stats_received_packets = 0;
+            tun->stats_group_packet_count = 0;
+            tun->last_stats_report_time = now_ms;
+
+            printf("[FEC] Sent loss report: expected=%d, received=%d, loss_rate=%d%%\n", expected, received, loss_rate);
+        } else {
+            tun->last_stats_report_time = now_ms;
+        }
+    }
 }
 
 /* Initialize Tunnel */
@@ -157,6 +388,15 @@ int tunnel_init(tunnel_t *tun, const tunnel_config_t *config) {
     } else {
         tun->tcp_listen_fd = -1;
     }
+    /* Initialize FEC */
+    gf_init();
+    tun->fec_n = 10;
+    tun->fec_r = 1;
+    memset(&tun->fec_enc, 0, sizeof(tun->fec_enc));
+    memset(&tun->fec_dec, 0, sizeof(tun->fec_dec));
+    tun->fec_enc.n = tun->fec_n;
+    tun->fec_enc.r = tun->fec_r;
+    tun->last_stats_report_time = bitun_osal_time_get_real_ms();
 
     return 0;
 }
@@ -281,6 +521,18 @@ void tunnel_run(tunnel_t *tun) {
             kcp_timeout = ikcp_check(tun->kcp, (IUINT32)now) - now;
             if (kcp_timeout > 50) kcp_timeout = 20;
             if (kcp_timeout <= 0) kcp_timeout = 5;
+
+            if (tun->state == STATE_CONNECTED && tun->fec_enc.r > 0 && tun->fec_enc.data_packet_count > 0) {
+                uint64_t now_real = bitun_osal_time_get_real_ms();
+                if (now_real - tun->fec_enc.last_packet_time >= 10) {
+                    send_parity_packets(tun);
+                } else {
+                    uint32_t fec_timeout = 10 - (now_real - tun->fec_enc.last_packet_time);
+                    if (fec_timeout < kcp_timeout) {
+                        kcp_timeout = fec_timeout;
+                    }
+                }
+            }
         }
 
         /* 1. State Machine Keepalives & Retransmissions */
@@ -638,7 +890,11 @@ void tunnel_run(tunnel_t *tun) {
                                inet_ntoa(from.sin_addr), ntohs(from.sin_port));
                     }
 
-                    ikcp_input(tun->kcp, (const char *)read_buf, decrypted_len);
+                    if (decrypted_len >= 6) {
+                        fec_header_t fec_hdr;
+                        memcpy(&fec_hdr, read_buf, 6);
+                        handle_incoming_fec_packet(tun, &fec_hdr, (const uint8_t *)read_buf + 6, decrypted_len - 6, now);
+                    }
                     tun->last_recv_time = now;
                 }
             } else if (fd == tun->tcp_listen_fd) {
@@ -816,6 +1072,30 @@ void tunnel_run(tunnel_t *tun) {
 
                 if (cmd == CMD_KEEPALIVE) {
                     tun->last_recv_time = now;
+                    continue;
+                }
+
+                if (cmd == CMD_FEC_FEEDBACK) {
+                    if (payload_len >= 1) {
+                        uint8_t loss_rate = payload[0];
+                        if (loss_rate == 0) {
+                            tun->fec_n = 10;
+                            tun->fec_r = 0;
+                        } else if (loss_rate <= 5) {
+                            tun->fec_n = 10;
+                            tun->fec_r = 1;
+                        } else if (loss_rate <= 10) {
+                            tun->fec_n = 8;
+                            tun->fec_r = 2;
+                        } else if (loss_rate <= 20) {
+                            tun->fec_n = 5;
+                            tun->fec_r = 2;
+                        } else {
+                            tun->fec_n = 4;
+                            tun->fec_r = 3;
+                        }
+                        printf("[FEC] Adaptive FEC update (loss=%d%%): N=%d, R=%d\n", loss_rate, tun->fec_n, tun->fec_r);
+                    }
                     continue;
                 }
 
