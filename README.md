@@ -29,6 +29,7 @@ flowchart TD
         A_TCP["本地 TCP 监听 / 建立连接<br>(SOCKS5 代理)"]:::peerA
         A_Mux["多路复用分路控制层<br>(奇偶 ID 隔离, 通道级流控)"]:::peerA
         A_KCP["KCP 协议层<br>(低延迟重传、拥塞控制)"]:::peerA
+        A_FEC["自适应 FEC 纠错层<br>(Cauchy-RS 编解码, 丢包率反馈)"]:::peerA
         A_AEAD["AEAD 安全保护垫<br>(ChaCha20-Poly1305, 防重放)"]:::peerA
     end
 
@@ -36,17 +37,20 @@ flowchart TD
         B_TCP["本地 TCP 监听 / 建立连接<br>(SOCKS5 代理)"]:::peerB
         B_Mux["多路复用分路控制层<br>(奇偶 ID 隔离, 通道级流控)"]:::peerB
         B_KCP["KCP 协议层<br>(低延迟重传、拥塞控制)"]:::peerB
+        B_FEC["自适应 FEC 纠错层<br>(Cauchy-RS 编解码, 丢包率反馈)"]:::peerB
         B_AEAD["AEAD 安全保护垫<br>(ChaCha20-Poly1305, 防重放)"]:::peerB
     end
 
     %% 内部层级流动
     A_TCP <--> A_Mux
     A_Mux <--> A_KCP
-    A_KCP <--> A_AEAD
+    A_KCP <--> A_FEC
+    A_FEC <--> A_AEAD
 
     B_TCP <--> B_Mux
     B_Mux <--> B_KCP
-    B_KCP <--> B_AEAD
+    B_KCP <--> B_FEC
+    B_FEC <--> B_AEAD
 
     %% 底层网络传输
     A_AEAD <--> B_AEAD:::network
@@ -77,15 +81,18 @@ flowchart LR
 2. **KCP 可靠传输与多路复用 (KCP & Channel Multiplexing)**
    * 在 UDP 之上集成了 KCP 可靠协议，提供低延迟、快速重传的 ARQ 流控。
    * 在单个 KCP 连接上实现多路复用，每个活跃通道（Channel）映射一个应用层 TCP 连接，分配奇偶 Channel ID 隔离双端并发。
-3. **极高等级的安全防线 (AEAD & Anti-Replay)**
+3. **自适应 Cauchy-RS FEC 前向纠错 (Adaptive Cauchy-RS FEC)**
+   * **高性能前向纠错**：基于有限域 GF(256) 的 Cauchy 矩阵 Reed-Solomon 算法，对数据包进行分组冗余编码（N 个数据包 + R 个冗余包），在丢包率高的网络环境下实现无重传恢复，极大降低数据抖动与时延。
+   * **丢包统计与自适应反馈**：接收端根据数据包的预期与实收情况统计实时丢包率，并通过控制指令 `CMD_FEC_FEEDBACK (0x07)` 实时反馈给发送端，发送端依此动态调节后续分组的 N 与 R 比例（最高可适应 >20% 的恶劣丢包环境）。
+4. **极高等级的安全防线 (AEAD & Anti-Replay)**
    * **全流量 AEAD 加密**：UDP 与 KCP 之间配有 ChaCha20-Poly1305 安全垫，所有数据及控制帧均在公网密文传输。
    * **会话密钥派生**：静态 PSK 仅用于认证。在握手期通过两端随机数利用 **HKDF-SHA256** 派生临时的 Ephemeral Session Key，彻底消除设备重启导致的 Nonce 重用风险。
    * **滑动窗口防重放**：接收端前置 IPsec 风格的 64 位防重放滑动窗口，过滤并静默丢弃任何重放包。
-4. **安全凭证快速重置 (Authenticated Fast Reconnection)**
+5. **安全凭证快速重置 (Authenticated Fast Reconnection)**
    * 对端意外重启时，会发出携带静态 PSK 签名的 `AUTH_RESET` 重置帧。已连接端在通过时间戳容差（±5s）及 HMAC 完整性校验后，会**在毫秒级内主动销毁旧连接并响应重连**，避免了传统安全过滤器屏蔽重连报文引发的 30 秒超时挂死。
-5. **连接无感迁移 (Connection Migration)**
+6. **连接无感迁移 (Connection Migration)**
    * 当对端因 Wi-Fi/蜂窝切换或对称 NAT 端口重映射导致公网 IP:Port 发生突变时，只要新来源的数据包通过了 AEAD 解密校验，系统会自动平滑更新对端目标地址，**KCP 状态与应用层 TCP 流量无感保持**。
-6. **精细化流控与背压 (Flow Control & Backpressure)**
+7. **精细化流控与背压 (Flow Control & Backpressure)**
    * **发送侧背压**：监控 KCP 待发队列（`waitsnd >= 32`），挂起本地 TCP 的 `EPOLLIN` 触发读取，并配合单通道单次 2KB 读取限流，确保系统 Heap 安全，杜绝 OOM。
    * **接收侧通道级流控**：借鉴 SSH/HTTP2 机制，各 Channel 维护独立的 4KB 滑动窗口并以 `CMD_WINDOW_UPDATE (0x06)` 推进，彻底解决了“慢消费通道卡死快通道”的**队头阻塞 (HOL Blocking)** 隐患。
 
@@ -173,7 +180,9 @@ bash run_integration_test.sh
 ```text
 bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 ```
-* `-p, --port`：本地绑定端口。也作为本地 SOCKS5 TCP 监听端口。
+* `-p, --port`：本地绑定端口。为了简化配置，本程序会**同时在 TCP 和 UDP 上绑定此端口**：
+  * **TCP 端口**：作为本地 SOCKS5 代理的监听端口，供客户端连接。
+  * **UDP 端口**：用于 KCP 隧道加密通信（两端打洞、心跳等数据交换）。
 * `-r, --remote`：对端 UDP 通信地址（`IP:Port`）。**若省略此参数，则本端进入被动监听/动态学习模式**。
 * `-k, --psk`：预共享密钥（PSK，将自动处理为 32 字节密钥）。
 * `--odd` / `--even`：设置本端生成通道 ID 时是生成奇数还是偶数。两端必须一端为 odd，另一端为 even 以规避并发冲突。
@@ -183,23 +192,23 @@ bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 ### 💡 典型应用场景配置
 
 #### 场景 1：双向 SOCKS5 动态代理 (双进程本地模拟)
-* **Peer A** (在 UDP 9000 端口提供 SOCKS5 代理，主动向 Peer B 打洞，奇数 ID 侧)：
+* **Peer A** (绑定 9000 端口，主动向 Peer B 打洞，奇数 ID 侧)：
   ```bash
   ./bitun -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
   ```
-* **Peer B** (在 UDP 9001 端口提供 SOCKS5 代理，主动向 Peer A 打洞，偶数 ID 侧)：
+* **Peer B** (绑定 9001 端口，主动向 Peer A 打洞，偶数 ID 侧)：
   ```bash
   ./bitun -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
   ```
 * *测试*：
-  两端同时运行 SOCKS5 代理服务。连接本地 `127.0.0.1:9000` 或 `127.0.0.1:9001` 的 SOCKS5 端口即可访问对端出口 of 代理。
+  两端会同时在本地的 TCP 9000 和 TCP 9001 启动 SOCKS5 代理。连接本地 `127.0.0.1:9000` 或 `127.0.0.1:9001` 的 SOCKS5 端口即可访问对端出口的代理。
 
 #### 场景 2：主动 - 被动动态学习打洞 (公网服务器与内网终端对称连接)
-* **VPS 侧** (监听本地 UDP 9000，等待接入，动态学习客户端公网 IP:Port)：
+* **VPS 侧** (被动端，绑定 9000 端口，等待接入，动态学习客户端公网 IP:Port)：
   ```bash
   ./bitun -p 9000 -k MySecretPSKKey123456789012345678 --odd
   ```
-* **本地内网侧** (监听 UDP 9001，向公网 VPS 主动持续打洞探测)：
+* **本地内网侧** (主动端，绑定 9001 端口，向公网 VPS 主动持续打洞探测)：
   ```bash
   ./bitun -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
   ```

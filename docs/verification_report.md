@@ -26,6 +26,7 @@
 | **7.2.2 通道级滑动窗口** | 4KB 独立接收窗口，`CMD_WINDOW_UPDATE` (0x06) 接收端消费后发送窗口增量。 | [src/tunnel.c](file:///home/chenming/BiTun/src/tunnel.c) | `CMD_DATA` 接收与 `CMD_WINDOW_UPDATE` 处理 | [L883-L895](file:///home/chenming/BiTun/src/tunnel.c#L883-L895)；[L904-L913](file:///home/chenming/BiTun/src/tunnel.c#L904-L913) | 接收端发送累积窗口更新；发送端扣减 `send_wnd`。 |
 | **8.1 加密与防重放窗口** | ChaCha20-Poly1305 AEAD 加密，64 位递增 Seq，64 长度 IPsec 滑动窗口防重放。 | [src/encrypt.c](file:///home/chenming/BiTun/src/encrypt.c) | `anti_replay_check`、`anti_replay_update` 等 | [L5-L48](file:///home/chenming/BiTun/src/encrypt.c#L5-L48) | 使用位操作实现滑动窗口；非解密前校验过滤防 DoS。 |
 | **8.2 密钥协商与临时密钥** | 交换随机数，HKDF-SHA256 结合 PSK 派生 `Session_Key`。 | [src/encrypt.c](file:///home/chenming/BiTun/src/encrypt.c) | `derive_session_key` | [L56-L92](file:///home/chenming/BiTun/src/encrypt.c#L56-L92) | 通过对 `R_local` 和 `R_remote` 进行 `memcmp` 确定排序，确保双方 Salt 输入完全一致。 |
+| **9. 自适应前向纠错** | Cauchy-RS 冗余编解码，基于丢包率反馈 CMD_FEC_FEEDBACK (0x07) 动态调节 N 和 R。 | [src/fec.c](file:///home/chenming/BiTun/src/fec.c)<br/>[src/tunnel.c](file:///home/chenming/BiTun/src/tunnel.c) | `fec_encode`、`fec_decode`、`handle_incoming_fec_packet` | [L1-L144](file:///home/chenming/BiTun/src/fec.c#L1-L144)；[L159-L298](file:///home/chenming/BiTun/src/tunnel.c#L159-L298) | 在有限域 GF(256) 下构建柯西生成矩阵并编码；解码使用高斯-若尔当消元逆矩阵恢复丢失块；接收端在处理包并于周期/数量达标后统计并发送丢包率反馈，发送端自适应调整 N 与 R 比例。 |
 
 ---
 
@@ -75,6 +76,14 @@
     2.  使用测试工具连接本地 SOCKS5 代理端口，将握手包（`0x05 0x01 0x00`）拆分成 3 个单独的字节，每个字节间隔 100ms 发送。
     3.  观察通道是否保持活跃，且在最后一个字节发送后是否正确返回 `0x05 0x00`。
 *   **判定标准**：代理连接成功建立，状态机没有进入 `STATE_ERROR`。
+
+### 🧪 测试用例 6：自适应 Cauchy-RS FEC 纠错与丢包容忍度测试 (Adaptive Cauchy-RS FEC & Loss Tolerance Testing)
+*   **测试目的**：验证在公网弱网丢包环境下，自适应 FEC 模块能依靠冗余包无重传地恢复丢失的数据包，并且根据丢包统计动态调节 $N$ 和 $R$ 参数。
+*   **执行步骤**：
+    1.  启动 Peer A 与 Peer B 建立加密连接并注入 $10\%$ 网络包丢失率。
+    2.  发送数据包并监控日志，检查 FEC 算法对丢失包的解码与恢复。
+    3.  确认接收端发出反馈帧，发送端接收后自适应调节 $N$ 和 $R$ 的取值。
+*   **判定标准**：接收端可无重传完全恢复丢失的 KCP 包，且发送端动态调整编码比率至 $N=8, R=2$。
 
 ---
 
@@ -132,10 +141,14 @@
     *   双方收到对方的 Response 校验值，使用 `const_memcmp` 与本地期望值对比。
     *   两端校验成功，打印：`Authenticated Peer successfully!`。
     *   各自通过 HKDF-SHA256 派生会话密钥 `Session_Key` 并初始化 KCP，隧道彻底打通：`Symmetric handshake complete. STATE_CONNECTED established.`。
-5.  **并发 SOCKS5 多路复用与自管道 DNS 流转**：
+5.  **自适应前向纠错 (FEC) 编解码与反馈校验**：
+    *   在模拟丢包的情况下，接收端 B 如果在当前组中检测到数据包丢失，会运行高斯消元解码成功重建包，并输出：`[FEC] Successfully reconstructed lost packet group_id=... index=... len=...`。
+    *   接收端累计实收和应收包数后，向 A 发送丢包率，输出：`[FEC] Sent loss report: expected=..., received=..., loss_rate=10%`。
+    *   发送端 A 收到反馈后成功动态自适应调整编码参数，输出：`[FEC] Adaptive FEC update (loss=10%): N=8, R=2`。
+6.  **并发 SOCKS5 多路复用与自管道 DNS 流转**：
     *   Peer A 侧有客户端接入 SOCKS5，为其分配通道 ID 1，并执行无 static 变量的流式方法与地址解析。
     *   A 将 CONNECT 请求通过 KCP 投递给 B。B 收到后，由于 ATYP 为域名，B 启动异步线程执行 DNS 解析，打印：`[DNS] Resolving target-website.com asynchronously...`。
     *   DNS 线程执行完毕后，主线程通过自管道收到结果 `dns_result_t` 并打印：`[DNS] Pipe handler: Connecting to target for channel 1...`。在非阻塞 TCP 连接成功后回发 CONNECT_ACK，两端进入 Forwarding 并开始传输数据。
     *   双进程中，大流量传输触发 KCP 发送背压。当拥塞解除，主循环调用 MOD 激活边缘触发器，顺利复位：`[Backpressure] Resumed and reactivated Epoll read for channel 1.`，未发生任何卡线或死锁。
 
-该实测结果全面、扎实地证明了 C 代码逻辑与 [docs/design.md](file:///home/chenming/BiTun/docs/design.md) 中关于打洞、状态机、带安全凭证重置、连接迁移、安全 AEAD 以及自管道 DNS 和背压的每一处核心设计完全吻合。
+该实测结果全面、扎实地证明了 C 代码逻辑与 [docs/design.md](file:///home/chenming/BiTun/docs/design.md) 中关于打洞、状态机、带安全凭证重置、连接迁移、自适应前向纠错（FEC）、安全 AEAD 以及自管道 DNS 和背压的每一处核心设计完全吻合。

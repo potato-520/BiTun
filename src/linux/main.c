@@ -21,16 +21,17 @@ static void print_usage(const char *prog) {
     printf("Usage:\n");
     printf("  %s -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]\n\n", prog);
     printf("Options:\n");
-    printf("  -p, --port      Local port to bind to (e.g. 8080 for SOCKS5 or forwarding)\n");
+    printf("  -p, --port      Local port to bind to. Binds to BOTH TCP (for SOCKS5 proxy listener)\n");
+    printf("                  and UDP (for KCP tunnel) simultaneously on the same port.\n");
     printf("  -r, --remote    Remote peer UDP endpoint in IP:Port format. Omit for dynamic passive learning mode.\n");
     printf("  -k, --psk       Pre-shared key (exactly 32 characters, or padded/truncated to 32 bytes)\n");
     printf("  --odd           Configure this process to generate ODD channel IDs (default)\n");
     printf("  --even          Configure this process to generate EVEN channel IDs\n");
     printf("  -h, --help      Show this help information\n\n");
     printf("Examples:\n");
-    printf("  # Start Peer A (SOCKS5 Proxy Listener, generating odd channel IDs, waiting for Peer B connection):\n");
+    printf("  # Start Peer A (Binds TCP and UDP port 9000, waiting for Peer B, ODD IDs):\n");
     printf("  %s -p 9000 -k MySecretPSKKey123456789012345678 --odd\n\n", prog);
-    printf("  # Start Peer B (Connecting to Peer A on local UDP port 9000, listening on 9001 for local clients):\n");
+    printf("  # Start Peer B (Binds TCP and UDP port 9001, connects to Peer A UDP port 9000, EVEN IDs):\n");
     printf("  %s -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even\n", prog);
 }
 

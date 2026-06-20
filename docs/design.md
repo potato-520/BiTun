@@ -32,6 +32,9 @@
 |          KCP 协议层 (可靠传输层)          |
 |  (提供重传、拥塞控制、流控，通过 ikcp 实现) |
 +------------------------------------------+
+|     自适应 FEC 纠错层 (前向纠错层)        |
+|  (基于 Cauchy-RS 进行分组编码与包级恢复)   |
++------------------------------------------+
 |          UDP 传输层 (UDP Socket)         |
 +------------------------------------------+
 |                 物理介质                  |
@@ -41,6 +44,7 @@
 ### 2.1 各层职责定义
 
 *   **UDP 传输层**：底层的无连接数据报传输通道。负责发送与接收原始 UDP 包，是 NAT 打洞与保活的承载载体。
+*   **自适应 FEC 纠错层 (Forward Error Correction)**：在 KCP 产生输出包时对其进行自适应 Cauchy-RS 冗余编码；在接收端丢包时，利用收到的冗余包执行高斯消元解码恢复丢失的 KCP 包。同时统计丢包率并向上反馈，动态调节纠错冗余比率。
 *   **KCP 协议层**：将不稳定的 UDP 包转换为可靠的字节流。通过合理的窗口调优（针对 ESP32 内存），提供快速重传和选择性确认（SACK），避免 TCP 的拥塞窗口剧烈抖动。
 *   **分路控制层 (Channel Multiplexing)**：在可靠字节流上切片并进行多路复用。每个分路（Channel）映射一个应用层 TCP 连接。通过帧头中的 `Channel ID` 进行流量的分流与合流。
 *   **应用层**：包含普通的 TCP 透传流与 SOCKS5 代理流。
@@ -594,5 +598,55 @@ stateDiagram-v2
         $$Session\_Key = HKDF\_Expand(PRK, Info=\text{"BiTun Ephemeral Key"}, L=32)$$
     -   此后所有的 ChaCha20-Poly1305 AEAD 加密和解密均使用该动态生成的 $Session\_Key$。
 4.  **消除 Nonce 重用风险**：
-    -   由于每次连接时两端都会通过硬件真随机数生成器产生全新的 $R_{init}$ 与 $R_{resp}$，HKDF-SHA256 派生出的 $Session\_Key$ 必然完全随机且不同。
-    -   即使 ESP32 因为突然重启、死机或断电导致底层 Sequence Number 发生重置（从 0 重新计数），由于新连接派生的 $Session\_Key$ 已经改变，在相同的 Key 下绝不会产生相同的 Nonce 组合对（$(Key, Nonce)$），从而在数学和工程上彻底杜绝了流密码密钥流泄露漏洞。
+    -   Due to each connection establishing a unique random salt from both sides, HKDF-SHA256 derived keys are always distinct.
+    -   Even if the ESP32 reboots and sequence numbers reset to zero, there is no Nonce reuse risk.
+
+---
+
+## 9. 自适应前向纠错机制 (Adaptive Forward Error Correction - FEC)
+
+在弱网或无线高丢包（如 Wi-Fi 抖动、蜂窝边缘信号、或跨公网丢包）环境下，传统的 KCP ARQ 重传机制虽然能保证可靠性，但会因为丢包触发重传，从而引入额外的往返时延（RTT）及抖动，严重恶化 TCP 应用层流量（如 SOCKS5）的吞吐表现。
+
+为此，系统集成了基于 Cauchy-RS（柯西矩阵 Reed-Solomon）的前向纠错层（FEC），在底层 UDP 报文外包了一层自适应的数据纠错护盾。
+
+### 9.1 Cauchy Reed-Solomon 算法实现
+
+*   **GF(256) 有限域运算**：采用生成多项式 $x^8 + x^4 + x^3 + x^2 + 1$（二进制码 `0x11d`）初始化指数表 (`gf_exp`) 和对数表 (`gf_log`)，乘除法通过查表直接计算以规避运行时耗时运算，极度适配 ESP32 等嵌入式设备的计算力限制。
+*   **生成矩阵构建**：使用系统生成矩阵 $G = \begin{pmatrix} I_N \\ C_{R \times N} \end{pmatrix}$，其中 $I_N$ 为 $N \times N$ 单位阵（数据块直接透传），下方的 $C$ 为柯西矩阵。柯西矩阵中第 $i$ 行、第 $j$ 列的系数表示为：
+    $$C_{i, j} = \frac{1}{x_i \oplus y_j}$$
+    系统选取 $x_i = i + N$，$y_j = j$。当 $N+R \le 24$ 时，元素互斥，除数永远不为零。
+*   **编解码与内存分配**：编码过程直接在数据包缓冲区中完成，不使用任何运行时堆内存动态分配（满足嵌入式零 Heap 碎片要求）。解码端在收集到任意 $N$ 个包（包含原始数据包与冗余校验包）后，截取对应的 $N \times N$ 生成子矩阵，采用 **Gauss-Jordan（高斯-若尔当）消元法** 进行逆矩阵求解，从而计算并恢复出所有丢失的原始数据包。
+
+### 9.2 FEC 包头与组包结构 (FEC Packet Overhead & Grouping)
+
+在 KCP 发送端输出数据包时，前置一个 6 字节的 FEC 头部：
+```c
+typedef struct {
+    uint16_t group_id;   // 组唯一 ID
+    uint8_t index;       // 当前包索引 (0 ~ N-1 为数据包, N ~ N+R-1 为冗余校验包)
+    uint8_t n;           // 当前组中的有效数据包数 N
+    uint8_t r;           // 当前组中的冗余包数 R
+    uint8_t reserved;    // 保留字段，内存对齐 (0x00)
+} __attribute__((packed)) fec_header_t;
+```
+
+*   **对齐处理与 MTU 限制**：由于编解码的数学要求各块必须等长，系统定义 `FEC_BLOCK_SIZE = 1408` 字节，足以容纳最大 KCP MTU。数据包前置 2 字节（大端序）表示其实际载荷长度，后跟原始 KCP 包，不足部分填充零。
+*   **发送时延控制**：发送端在收集满 $N$ 个包时触发编码产生 $R$ 个冗余包并发送。为防止小流量下的超时等待，当组内首包发送超过 `10ms` 且包数未满 $N$ 时，发送端会自动截断分组并动态调整 $N_{effective} = \text{data\_packet\_count}$，然后进行冗余计算发送，保证了极高的实时性。
+
+### 9.3 丢包统计反馈与参数自适应调节 (Loss Feedback & Adaptive Selection)
+
+为了避免在良好网络下无谓的冗余开销（Bandwidth Waste），也为了能在恶劣网络下提供足够的保护力，系统实现了自适应调节逻辑：
+
+*   **接收端丢包统计**：接收端处理每个包时，统计实收包数与这些包头部声明的预期总包数（$N+R$）。在累计处理 100 个数据包或经过 1 秒时，计算其实时丢包率：
+    $$\text{loss\_rate} = \frac{\text{expected\_packets} - \text{received\_packets}}{\text{expected\_packets}} \times 100\%$$
+*   **反馈控制帧**：计算出的丢包率（0-100的单字节值）通过控制通道以 `CMD_FEC_FEEDBACK (0x07)` 指令发送至发送端。
+*   **发送端调节策略**：发送端接收到反馈后，按照下表动态调整下一分组的 $N$ 与 $R$ 参数：
+    | 丢包率区间 | 参数选择 | 冗余开销 | 适用场景 |
+    | :--- | :--- | :--- | :--- |
+    | **$0\%$** | $N=10, R=0$ | $0\%$ (直通模式) | 无丢包优质网络（节省带宽） |
+    | **$1\% \sim 5\%$** | $N=10, R=1$ | $10\%$ | 轻微抖动无线环境 |
+    | **$5\% \sim 10\%$** | $N=8, R=2$ | $25\%$ | 常见互联网中度丢包 |
+    | **$10\% \sim 20\%$** | $N=5, R=2$ | $40\%$ | 弱网、跨国公网连接 |
+    | **$> 20\%$** | $N=4, R=3$ | $75\%$ | 恶劣网络、严重无线衰减或防拥塞丢包 |
+
+通过该机制，隧道能够在丢包暴增时秒级内响应，保证了在高丢包环境下的吞吐率和极低时延。
