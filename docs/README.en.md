@@ -190,27 +190,27 @@ bash run_integration_test.sh
 
 ### Command Line Syntax
 ```text
-bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
+bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk>
 ```
 * `-p, --port`: Local port to bind to. For simplicity, the program **binds this port to both TCP and UDP simultaneously**:
   * **TCP Port**: Used as the SOCKS5 proxy listener for local client connections.
   * **UDP Port**: Used for KCP encrypted tunnel communication (hole punching, handshakes, traffic).
 * `-r, --remote`: Remote peer UDP endpoint (`IP:Port`). **Omit this parameter to run in passive dynamic learning mode**.
 * `-k, --psk`: Pre-shared key (automatically padded or truncated to 32 bytes).
-* `--odd` / `--even`: Configures the peer to generate Odd or Even Channel IDs to prevent collisions. One side must be odd and the other must be even.
+* *Note*: The `--odd` and `--even` command-line options are deprecated and ignored. Odd/even channel ID roles are now automatically negotiated during handshaking based on the lexicographical comparison of the randomly-generated challenge salts (`R_local` vs `R_remote`). The side with the larger salt gets ODD (1), and the side with the smaller salt gets EVEN (0).
 
 ---
 
 ### 💡 Application Scenarios
 
 #### Scenario 1: Symmetric Bidirectional SOCKS5 Proxy (Double Process Simulation)
-* **Peer A** (Binds port 9000, initiating connection to B, Odd IDs):
+* **Peer A** (Binds port 9000, initiating connection to B):
   ```bash
-  ./bitun -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678
   ```
-* **Peer B** (Binds port 9001, initiating connection to A, Even IDs):
+* **Peer B** (Binds port 9001, initiating connection to A):
   ```bash
-  ./bitun -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678
   ```
 * *Test*:
   Both Peer A and Peer B will serve as SOCKS5 proxies simultaneously on TCP 9000 and TCP 9001. Configure your browser or curl to use either `127.0.0.1:9000` or `127.0.0.1:9001` as a SOCKS5 proxy to access services behind the other end.
@@ -218,11 +218,11 @@ bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 #### Scenario 2: Active-Passive Hole Punching (VPS Hub & LAN Node)
 * **VPS Side** (Passive end, binds port 9000, waiting for connection, dynamically learning the client NAT address):
   ```bash
-  ./bitun -p 9000 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -k MySecretPSKKey123456789012345678
   ```
 * **LAN Side** (Active end, binds port 9001, actively punching to the public VPS):
   ```bash
-  ./bitun -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678
   ```
 
 ---

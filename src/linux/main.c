@@ -5,9 +5,6 @@
 #include "tunnel.h"
 #include "bitun_osal.h"
 
-/* Global odd/even ID generator flag */
-int g_is_odd_id_generator = 1;
-
 static tunnel_t g_tun;
 volatile sig_atomic_t g_should_exit = 0;
 
@@ -19,20 +16,21 @@ static void handle_signal(int sig) {
 static void print_usage(const char *prog) {
     printf("BiTun Symmetrical Tunnel Simulator - PC Version\n");
     printf("Usage:\n");
-    printf("  %s -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]\n\n", prog);
+    printf("  %s -p <local_port> [-r <remote_ip:remote_port>] -k <psk>\n\n", prog);
     printf("Options:\n");
     printf("  -p, --port      Local port to bind to. Binds to BOTH TCP (for SOCKS5 proxy listener)\n");
     printf("                  and UDP (for KCP tunnel) simultaneously on the same port.\n");
     printf("  -r, --remote    Remote peer UDP endpoint in IP:Port format. Omit for dynamic passive learning mode.\n");
     printf("  -k, --psk       Pre-shared key (exactly 32 characters, or padded/truncated to 32 bytes)\n");
-    printf("  --odd           Configure this process to generate ODD channel IDs (default)\n");
-    printf("  --even          Configure this process to generate EVEN channel IDs\n");
     printf("  -h, --help      Show this help information\n\n");
+    printf("Note:\n");
+    printf("  Odd/even channel IDs are now automatically negotiated based on the Active/Passive roles\n");
+    printf("  or randomly-generated challenge salts. The --odd and --even options are deprecated and ignored.\n\n");
     printf("Examples:\n");
-    printf("  # Start Peer A (Binds TCP and UDP port 9000, waiting for Peer B, ODD IDs):\n");
-    printf("  %s -p 9000 -k MySecretPSKKey123456789012345678 --odd\n\n", prog);
-    printf("  # Start Peer B (Binds TCP and UDP port 9001, connects to Peer A UDP port 9000, EVEN IDs):\n");
-    printf("  %s -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even\n", prog);
+    printf("  # Start Peer A (Binds TCP and UDP port 9000, waiting for Peer B):\n");
+    printf("  %s -p 9000 -k MySecretPSKKey123456789012345678\n\n", prog);
+    printf("  # Start Peer B (Binds TCP and UDP port 9001, connects to Peer A UDP port 9000):\n");
+    printf("  %s -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678\n", prog);
 }
 
 int main(int argc, char **argv) {
@@ -57,9 +55,9 @@ int main(int argc, char **argv) {
             if (++i >= argc) { print_usage(argv[0]); return 1; }
             psk_str = argv[i];
         } else if (strcmp(argv[i], "--odd") == 0) {
-            g_is_odd_id_generator = 1;
+            printf("[Main] Warning: --odd is deprecated as channel ID roles are now automatically negotiated.\n");
         } else if (strcmp(argv[i], "--even") == 0) {
-            g_is_odd_id_generator = 0;
+            printf("[Main] Warning: --even is deprecated as channel ID roles are now automatically negotiated.\n");
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -101,9 +99,8 @@ int main(int argc, char **argv) {
         config.remote_port = atoi(colon + 1);
     }
 
-    printf("[Main] Initializing tunnel (Local Port: %d, ID Generator: %s)...\n",
-           config.local_port,
-           g_is_odd_id_generator ? "ODD" : "EVEN");
+    printf("[Main] Initializing tunnel (Local Port: %d, automatic ID negotiation enabled)...\n",
+           config.local_port);
 
     bitun_osal_dns_init();
 

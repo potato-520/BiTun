@@ -188,27 +188,27 @@ bash run_integration_test.sh
 
 ### 命令行参数语法
 ```text
-bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
+bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk>
 ```
 * `-p, --port`：本地绑定端口。为了简化配置，本程序会**同时在 TCP 和 UDP 上绑定此端口**：
   * **TCP 端口**：作为本地 SOCKS5 代理的监听端口，供客户端连接。
   * **UDP 端口**：用于 KCP 隧道加密通信（两端打洞、心跳等数据交换）。
 * `-r, --remote`：对端 UDP 通信地址（`IP:Port`）。**若省略此参数，则本端进入被动监听/动态学习模式**。
 * `-k, --psk`：预共享密钥（PSK，将自动处理为 32 字节密钥）。
-* `--odd` / `--even`：设置本端生成通道 ID 时是生成奇数还是偶数。两端必须一端为 odd，另一端为 even 以规避并发冲突。
+* *注*：`--odd` 和 `--even` 命令行参数已被弃用和忽略。通道的奇数/偶数 ID 侧現在通过握手协议自动协商決定：在握手阶段，双方通过比较各自生成的随机挑战盐（Challenge Salt）的字典序大小（`R_local` vs `R_remote`）自动决定（本端随机盐大的一端协商为 ODD，小的一端协商为 EVEN），从而完全避免 ID 冲突。
 
 ---
 
 ### 💡 典型应用场景配置
 
 #### 场景 1：双向 SOCKS5 动态代理 (双进程本地模拟)
-* **Peer A** (绑定 9000 端口，主动向 Peer B 打洞，奇数 ID 侧)：
+* **Peer A** (绑定 9000 端口，主动向 Peer B 打洞)：
   ```bash
-  ./bitun -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678
   ```
-* **Peer B** (绑定 9001 端口，主动向 Peer A 打洞，偶数 ID 侧)：
+* **Peer B** (绑定 9001 端口，主动向 Peer A 打洞)：
   ```bash
-  ./bitun -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678
   ```
 * *测试*：
   两端会同时在本地的 TCP 9000 和 TCP 9001 启动 SOCKS5 代理。连接本地 `127.0.0.1:9000` 或 `127.0.0.1:9001` 的 SOCKS5 端口即可访问对端出口的代理。
@@ -216,11 +216,11 @@ bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 #### 场景 2：主动 - 被动动态学习打洞 (公网服务器与内网终端对称连接)
 * **VPS 侧** (被动端，绑定 9000 端口，等待接入，动态学习客户端公网 IP:Port)：
   ```bash
-  ./bitun -p 9000 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -k MySecretPSKKey123456789012345678
   ```
 * **本地内网侧** (主动端，绑定 9001 端口，向公网 VPS 主动持续打洞探测)：
   ```bash
-  ./bitun -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678
   ```
 
 ---

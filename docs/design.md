@@ -75,7 +75,7 @@
 
 | 字段名 | 长度 (字节) | 类型 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **Channel ID** | 4 | uint32_t | 通道唯一标识符，用于多路复用。为避免冲突：<br> - 由 **VPS 主动发起**的通道，使用**奇数** ID (1, 3, 5...)；<br> - 由 **ESP32 主动发起**的通道，使用**偶数** ID (2, 4, 6...)。 |
+| **Channel ID** | 4 | uint32_t | 通道唯一标识符，用于多路复用。为避免冲突，本端是作为奇数（ODD）还是偶数（EVEN）ID生成器，由握手阶段自动协商决定。 |
 | **Cmd Type** | 1 | uint8_t | 命令类型字。详细定义见 3.3 节。 |
 | **Reserved/Flags** | 1 | uint8_t | 保留或特定命令的标志位。目前默认为 `0x00`。 |
 | **Payload Length** | 2 | uint16_t | 载荷长度，取值范围 `0 ~ 65535` |
@@ -173,6 +173,7 @@ stateDiagram-v2
         -   *密钥派生*：
             $$PRK = HKDF\_Extract(Salt = R_{high} \ || \ R_{low}, IKM = PSK)$$
             $$Session\_Key = HKDF\_Expand(PRK, Info = \text{"BiTun Ephemeral Key"}, L = 32)$$
+        -   *通道 ID 生成角色协商*：基于双方生成的随机挑战盐的字典序进行通道 ID 奇偶生成器的自动协商。比较双方生成的随机挑战盐 `R_local` 和 `R_remote`（通过 `memcmp(R_local, R_remote, 32)`）。若本端 `R_local` 大于 `R_remote`，则本端协商为奇数生成器（`is_odd_id_generator = 1`），否则协商为偶数生成器（`is_odd_id_generator = 0`）。这不仅 100% 保证了协议在各种握手和重置场景下的兼容性，也完全避免了 ID 冲突。
         -   *初始化与转移*：初始化底层 KCP 协议栈与 AEAD 安全垫，将当前状态转移至 `STATE_CONNECTED`。
     *   *状态兼容与拉回机制*：如果本端（Peer A）已进入 `STATE_CONNECTED`，但在该状态下又收到了对端（Peer B）发来的 `AUTH_CHALLENGE` 报文（表明 B 的握手未同步，仍处于 `STATE_AUTH` 状态并在重发挑战），本端不能丢弃此包。本端必须立刻使用静态 PSK 重新计算并向 B 回复对应的 `AUTH_RESPONSE` 报文，以协助 B 顺利迁入 `STATE_CONNECTED` 状态，彻底避免半连接卡线。
     *   *超时回退*：若 5 秒握手定时器超时仍未完成双向认证，本端立即清空握手上下文，回退至 `STATE_DISCONNECTED`。若对端是动态学习到的，则清空对端地址。

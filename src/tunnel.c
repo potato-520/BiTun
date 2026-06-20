@@ -302,6 +302,7 @@ int tunnel_init(tunnel_t *tun, const tunnel_config_t *config) {
     memset(tun, 0, sizeof(tunnel_t));
     tun->config = *config;
     tun->state = STATE_DISCONNECTED;
+    tun->is_odd_id_generator = 1; /* Default to ODD */
     anti_replay_init(&tun->anti_replay_win);
     bitun_osal_mutex_create(&tun->mutex);
     
@@ -685,6 +686,10 @@ void tunnel_run(tunnel_t *tun) {
                     memcpy(magic, read_buf, 4);
 
                     if (memcmp(magic, MSG_PING, 4) == 0) {
+                        if (n < (int)sizeof(handshake_ping_pong_t)) {
+                            printf("[Warning] Received MSG_PING with invalid size: %d\n", n);
+                            continue;
+                        }
                         handshake_ping_pong_t *ping = (handshake_ping_pong_t *)read_buf;
                         uint8_t sig[32];
                         uint8_t data[12];
@@ -723,6 +728,10 @@ void tunnel_run(tunnel_t *tun) {
                         }
                         continue;
                     } else if (memcmp(magic, MSG_PONG, 4) == 0) {
+                        if (n < (int)sizeof(handshake_ping_pong_t)) {
+                            printf("[Warning] Received MSG_PONG with invalid size: %d\n", n);
+                            continue;
+                        }
                         handshake_ping_pong_t *pong = (handshake_ping_pong_t *)read_buf;
                         uint8_t sig[32];
                         uint8_t data[12];
@@ -741,6 +750,10 @@ void tunnel_run(tunnel_t *tun) {
                         }
                         continue;
                     } else if (memcmp(magic, MSG_CHAL, 4) == 0) {
+                        if (n < (int)sizeof(handshake_challenge_t)) {
+                            printf("[Warning] Received MSG_CHAL with invalid size: %d\n", n);
+                            continue;
+                        }
                         handshake_challenge_t *chal = (handshake_challenge_t *)read_buf;
                         uint8_t sig[32];
                         uint8_t data[36];
@@ -750,6 +763,31 @@ void tunnel_run(tunnel_t *tun) {
 
                         if (const_memcmp(sig, chal->signature, 32) == 0) {
                             memcpy(tun->r_remote, chal->random_salt, 32);
+                            
+                            if (tun->state == STATE_CONNECTED) {
+                                printf("[Handshake] Received new challenge while connected. Re-keying and recreating KCP.\n");
+                                if (tun->kcp) {
+                                    ikcp_release(tun->kcp);
+                                    tun->kcp = NULL;
+                                }
+                                derive_session_key(tun->config.psk, PSK_LEN, tun->r_local, 32, tun->r_remote, 32, tun->session_key);
+                                
+                                /* Run negotiation on r_local vs r_remote */
+                                if (memcmp(tun->r_local, tun->r_remote, 32) > 0) {
+                                    tun->is_odd_id_generator = 1;
+                                    printf("[Handshake] Negotiation on Re-key: Local Salt > Peer Salt -> Channel ID: ODD\n");
+                                } else {
+                                    tun->is_odd_id_generator = 0;
+                                    printf("[Handshake] Negotiation on Re-key: Local Salt <= Peer Salt -> Channel ID: EVEN\n");
+                                }
+
+                                /* Recreate KCP */
+                                tun->kcp = ikcp_create(0x11223344, tun);
+                                ikcp_setoutput(tun->kcp, kcp_output_cb);
+                                ikcp_wndsize(tun->kcp, 32, 32);
+                                ikcp_setmtu(tun->kcp, KCP_MTU);
+                                ikcp_nodelay(tun->kcp, 1, 20, 2, 1);
+                            }
                             
                             /* Respond Challenge HMAC Response */
                             handshake_response_t resp;
@@ -767,6 +805,10 @@ void tunnel_run(tunnel_t *tun) {
                         }
                         continue;
                     } else if (memcmp(magic, MSG_RESP, 4) == 0) {
+                        if (n < (int)sizeof(handshake_response_t)) {
+                            printf("[Warning] Received MSG_RESP with invalid size: %d\n", n);
+                            continue;
+                        }
                         handshake_response_t *resp = (handshake_response_t *)read_buf;
                         
                         /* Expected Response = HMAC_PSK(R_remote || R_local || "BiTun Handshake Challenge") */
@@ -784,6 +826,15 @@ void tunnel_run(tunnel_t *tun) {
                                 printf("[Handshake] Authenticated Peer successfully!\n");
                                 derive_session_key(tun->config.psk, PSK_LEN, tun->r_local, 32, tun->r_remote, 32, tun->session_key);
                                 
+                                /* Negotiate Odd/Even ID Generator */
+                                if (memcmp(tun->r_local, tun->r_remote, 32) > 0) {
+                                    tun->is_odd_id_generator = 1;
+                                    printf("[Handshake] Negotiation: Local Salt > Peer Salt -> Channel ID: ODD\n");
+                                } else {
+                                    tun->is_odd_id_generator = 0;
+                                    printf("[Handshake] Negotiation: Local Salt <= Peer Salt -> Channel ID: EVEN\n");
+                                }
+
                                 /* Initialize KCP */
                                 tun->kcp = ikcp_create(0x11223344, tun);
                                 ikcp_setoutput(tun->kcp, kcp_output_cb);
@@ -799,6 +850,10 @@ void tunnel_run(tunnel_t *tun) {
                         }
                         continue;
                     } else if (memcmp(magic, MSG_RESET, 4) == 0) {
+                        if (n < (int)sizeof(handshake_reset_t)) {
+                            printf("[Warning] Received MSG_RESET with invalid size: %d\n", n);
+                            continue;
+                        }
                         /* Handle Authenticated Reset */
                         handshake_reset_t *rst = (handshake_reset_t *)read_buf;
                         uint64_t rst_time = bitun_be64toh(rst->timestamp);
@@ -926,10 +981,9 @@ void tunnel_run(tunnel_t *tun) {
                         socks5_init(&ch->socks5_ctx);
 
                         /* Generate Channel ID */
-                        extern int g_is_odd_id_generator;
                         static uint32_t next_odd_id = 1;
                         static uint32_t next_even_id = 2;
-                        if (g_is_odd_id_generator) {
+                        if (tun->is_odd_id_generator) {
                             ch->channel_id = next_odd_id;
                             next_odd_id += 2;
                         } else {

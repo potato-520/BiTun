@@ -66,6 +66,7 @@ typedef struct {
     
     uint8_t r_local[32];
     uint8_t r_remote[32];
+    int is_odd_id_generator;
     uint8_t session_key[SESSION_KEY_LEN];
     
     uint64_t seq_send;
