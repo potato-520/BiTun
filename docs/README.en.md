@@ -126,13 +126,15 @@ flowchart LR
 └── src/                # Source code directory
     ├── bitun_osal.h    # Cross-platform OSAL interface
     ├── encrypt.c/h     # AEAD encryption, HKDF, anti-replay sliding window
+    ├── fec.c/h         # Adaptive Cauchy-RS FEC encoder/decoder
     ├── ikcp.c/h        # Core KCP protocol
     ├── socks5.c/h      # Stateless streaming SOCKS5 parser
     ├── tunnel.c/h      # Symmetric tunnel state machine, events, multiplexing, backpressure
-    ├── main.c          # CLI entry and config parser
     └── linux/          # Linux platform implementation
+        ├── main.c      # CLI entry and config parser
         ├── bitun_osal.c # Linux platform OSAL implementation
-        └── test_bitun_osal.c # OSAL unit test suite
+        ├── test_bitun_osal.c # OSAL unit test suite
+        └── test_fec.c  # FEC unit test suite
 ```
 
 ---
@@ -168,6 +170,14 @@ gcc -O2 -Wall -Wextra -pthread -Isrc -o test_bitun_osal src/linux/test_bitun_osa
 rm test_bitun_osal
 ```
 
+### Compile & Run FEC Unit Tests
+In the project root directory, run the following commands to compile and execute the FEC unit tests:
+```bash
+gcc -O2 -Wall -Wextra -Isrc -o test_fec src/linux/test_fec.c src/fec.c
+./test_fec
+rm test_fec
+```
+
 ### Run System Integration Tests
 In the project root directory, run the following command to execute the one-click system integration test:
 ```bash
@@ -182,12 +192,12 @@ bash run_integration_test.sh
 ```text
 bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 ```
-* `-p, --port`：Local port to bind to. For simplicity, the program **binds this port to both TCP and UDP simultaneously**:
+* `-p, --port`: Local port to bind to. For simplicity, the program **binds this port to both TCP and UDP simultaneously**:
   * **TCP Port**: Used as the SOCKS5 proxy listener for local client connections.
   * **UDP Port**: Used for KCP encrypted tunnel communication (hole punching, handshakes, traffic).
-* `-r, --remote`：Remote peer UDP endpoint (`IP:Port`). **Omit this parameter to run in passive dynamic learning mode**.
-* `-k, --psk`：Pre-shared key (automatically padded or truncated to 32 bytes).
-* `--odd` / `--even`：Configures the peer to generate Odd or Even Channel IDs to prevent collisions. One side must be odd and the other must be even.
+* `-r, --remote`: Remote peer UDP endpoint (`IP:Port`). **Omit this parameter to run in passive dynamic learning mode**.
+* `-k, --psk`: Pre-shared key (automatically padded or truncated to 32 bytes).
+* `--odd` / `--even`: Configures the peer to generate Odd or Even Channel IDs to prevent collisions. One side must be odd and the other must be even.
 
 ---
 

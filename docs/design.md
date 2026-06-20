@@ -290,129 +290,82 @@ sequenceDiagram
 2.  **目标地址热更新**：若该报文能够被成功解密并验证（证明发送方持有当前连接合法且唯一的临时会话密钥 `Session Key`），则本端判定对端发生了网络迁移。本端将在底层无缝且动态地将对端的目标 IP:Port 更新为新捕获的 IP:Port。
 3.  **连接无缝保持**：在整个地址更新过程中，底层的 KCP 实例与上层分路控制层（Channel Multiplexing）状态均保持不变，未确认数据包无需重传，TCP 流量无需中断，保证了网络变动下的零感平滑过渡。
 
-## 5. 四大核心场景数据流与时序 (Core Scenarios)
+## 5. 核心场景数据流与时序 (Core Scenarios)
 
-### 5.1 第一向：入站数据流平移
+BiTun 目前已简化为纯粹的双向 SOCKS5 动态代理通道。任何一端均可作为 SOCKS5 代理的入口，将数据包通过单一的 KCP 复用通道传输至对端，并在对端（作为出口）向目标服务器发起物理 TCP 连接。
 
-#### 场景 1：静态固定端口反向映射（单点入站）
-*   **目标**：公网访问 `VPS:8080`，流量平移至 `ESP32 本地 127.0.0.1:80`。
+### 5.1 双向 SOCKS5 动态代理时序
 
-```mermaid
-sequenceDiagram
-    autonumber
-    actor User as 外部用户
-    participant VPS as VPS (8080)
-    participant KCP as KCP 隧道 (UDP)
-    participant ESP32 as ESP32 核心
-    participant App as 本地 HTTP 服务 (80)
-
-    User->>VPS: TCP 三次握手 (连接 VPS:8080)
-    Note over VPS: 分配通道 ID (例如 1)
-    VPS->>KCP: 发送 CMD_CONNECT<br/>(Channel=1, Target=127.0.0.1:80)
-    KCP->>ESP32: 传输控制帧
-    
-    ESP32->>App: 调用 lwip_connect() 连接 127.0.0.1:80
-    App-->>ESP32: TCP 连接成功
-    ESP32->>KCP: 发送 CMD_CONNECT_ACK (Channel=1, Status=Success)
-    KCP->>VPS: 传输应答帧
-    
-    Note over VPS, ESP32: 通道建立完毕，进入全双工传输
-    User->>VPS: 发送 HTTP 请求
-    VPS->>KCP: 封装 CMD_DATA (Channel=1)
-    KCP->>ESP32: 解封装并转发
-    ESP32->>App: 发送原始 HTTP 数据
-    
-    App-->>ESP32: 回复 HTTP 响应
-    ESP32->>KCP: 封装 CMD_DATA (Channel=1)
-    KCP->>VPS: 解封装并转发
-    VPS-->>User: 发送 HTTP 响应
-```
-
-#### 场景 2：动态多目标请求代理（动态入站调度）
-*   **目标**：外部连接 `VPS:1080` (SOCKS5 代理端口)，ESP32 的无栈 SOCKS5 状态机流式解析目标并调用 `lwip_connect()`。
+当客户端向本地 Peer A 的 SOCKS5 代理端口发起连接并请求访问目标服务器时，其具体的数据流和状态机时序如下：
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as 外部 SOCKS5 客户端
-    participant VPS as VPS (1080)
-    participant KCP as KCP 隧道
-    participant ESP32_S5 as ESP32 SOCKS5 状态机
-    participant Target as 目标网站 (target-website.com:443)
+    actor Client as SOCKS5 客户端 (Client)
+    participant PeerA as Peer A (本地代理入口 / Entry)
+    participant KCP as KCP 加密隧道 (KCP Tunnel)
+    participant PeerB as Peer B (远端代理出口 / Exit)
+    participant Target as 目标服务器 (Target Server)
 
-    User->>VPS: TCP 连接建立 (VPS:1080)
-    Note over VPS: 分配通道 ID (例如 3)
-    VPS->>KCP: 发送 CMD_CONNECT (Channel=3, Type=SOCKS5_PROXY)
-    KCP->>ESP32_S5: 初始化 Channel 3 状态为 SOCKS5_STATE_INIT
-    ESP32_S5-->>VPS: 返回 CMD_CONNECT_ACK (Success)
+    Note over Client, PeerA: 阶段 1: 客户端与入口端 Method 协商
+    Client->>PeerA: TCP 三次握手 (连接 Peer A 监听端口)
+    Client->>PeerA: SOCKS5 方法协商请求 (VER=0x05, NMETHODS=1, METHODS=[0x00])
+    Note over PeerA: SOCKS5 状态机 (SOCKS5_STATE_INIT)
+    Note over PeerA: 状态迁移: INIT -> METHODS
+    PeerA->>Client: SOCKS5 方法选择响应 (VER=0x05, METHOD=0x00 - 无需认证)
+    Note over PeerA: 状态迁移: METHODS -> REQ_HEADER
+
+    Note over Client, PeerA: 阶段 2: 客户端发送连接请求
+    Client->>PeerA: SOCKS5 连接请求 (VER=0x05, CMD=0x01, RSV=0x00, ATYP, DST.ADDR, DST.PORT)
+    Note over PeerA: SOCKS5 状态机流式解析地址与端口
+    Note over PeerA: 状态迁移: REQ_HEADER -> REQ_ADDR_LEN -> REQ_ADDR_BODY -> REQ_PORT -> CONNECTING
+
+    Note over PeerA, PeerB: 阶段 3: 隧道连接请求与响应 (KCP)
+    Note over PeerA: 分配通道 ID (Channel ID)
+    PeerA->>KCP: 封装并发送 CMD_CONNECT 控制帧 (Channel ID, Target Addr Type, Target Port, Target Addr)
+    KCP-->>PeerB: ChaCha20-Poly1305 加密 UDP 传输
+    Note over PeerB: 解析 CMD_CONNECT 帧
     
-    User->>VPS: 发送 SOCKS5 握手 (Version=5, NMethods=1, Methods=[00])
-    VPS->>KCP: 发送 CMD_DATA (Channel=3, Payload=050100)
-    KCP->>ESP32_S5: 流式输入 050100
-    Note over ESP32_S5: 状态机解析：版本符合，无需验证
-    ESP32_S5->>KCP: 发送 CMD_DATA (Channel=3, Payload=0500)
-    KCP->>VPS: 透传响应
-    VPS-->>User: 响应 SOCKS5 握手 (0500)
-    
-    User->>VPS: 发送 CONNECT 请求 (target-website.com:443)
-    VPS->>KCP: 发送 CMD_DATA (Channel=3, Payload=...)
-    KCP->>ESP32_S5: 流式解析目标地址与端口
-    Note over ESP32_S5: 解析出 target-website.com:443
-    
-    ESP32_S5->>Target: 物理出口调用 lwip_connect() 建立 TCP
-    Target-->>ESP32_S5: TCP 连接成功
-    
-    ESP32_S5->>KCP: 发送 CMD_DATA (Channel=3, SOCKS5_Success_Reply)
-    KCP->>VPS: 透传
-    VPS-->>User: 响应连接成功
-    Note over ESP32_S5: 状态机切换为 FORWARDING 状态，此后进行纯透明双向转发
-    
-    User->>Target: 全双工数据传输 (通过 KCP CMD_DATA 承载)
+    alt 目标地址为域名 (ADDR_TYPE_DOMAIN)
+        Note over PeerB: 发起异步 DNS 解析 (bitun_osal_dns_resolve_async)
+        PeerB->>Target: DNS 解析成功后，调用 socket_connect()
+    else 目标地址为 IP (ADDR_TYPE_IPV4 / IPV6)
+        PeerB->>Target: 直接调用 socket_connect() 发起 TCP 握手
+    end
+
+    alt 连接建立成功 (Connection Succeeded)
+        Target-->>PeerB: TCP 握手完成 (Connected)
+        PeerB->>KCP: 发送 CMD_CONNECT_ACK (Channel ID, Status=0x00)
+        KCP-->>PeerA: 传输应答帧
+        Note over PeerA: 状态迁移: CONNECTING -> FORWARDING
+        PeerA->>Client: 响应 SOCKS5 连接成功 (VER=0x05, REP=0x00, RSV=0x00, ATYP=0x01, BND.ADDR=0, BND.PORT=0)
+    else 连接建立失败 (Connection Failed)
+        PeerB->>KCP: 发送 CMD_CONNECT_ACK (Channel ID, Status=0x01)
+        KCP-->>PeerA: 传输应答帧
+        Note over PeerA: 状态迁移: CONNECTING -> ERROR
+        PeerA->>Client: 响应 SOCKS5 连接失败 (VER=0x05, REP=0x05 - Connection refused)
+        Note over PeerA: 关闭客户端 TCP 连接并清理通道
+    end
+
+    Note over Client, Target: 阶段 4: 全双工数据转发阶段 (以连接成功为例)
+    rect rgb(230, 245, 255)
+        Client->>PeerA: 发送 TCP 数据载荷
+        PeerA->>KCP: 封装为 CMD_DATA 控制帧 (Channel ID, Payload)
+        KCP-->>PeerB: 传输
+        PeerB->>Target: 解封装并向目标 TCP 发送 Payload
+    end
+    rect rgb(230, 255, 230)
+        Target->>PeerB: 响应 TCP 数据载荷
+        PeerB->>KCP: 封装为 CMD_DATA 控制帧 (Channel ID, Payload)
+        KCP-->>PeerA: 传输
+        PeerA->>Client: 解封装并向客户端 TCP 发送 Payload
+    end
+    Note over PeerA, PeerB: 接收端每消费 2KB 数据，发送 CMD_WINDOW_UPDATE 推进滑动窗口
 ```
 
----
+## 6. 跨平台无状态流式 SOCKS5 状态机 (Cross-platform Stateless SOCKS5 State Machine)
 
-### 5.2 第二向：出站数据流平移
-
-#### 场景 3：本地静态端口正向映射（单点出站）
-*   **目标**：本地设备连接 `ESP32:3389`，流量转发至 `VPS 所在的远端私有服务 192.168.1.100:3389`。
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Local as 本地 RDP 客户端
-    participant ESP32 as ESP32 (监听 3389)
-    participant KCP as KCP 隧道
-    participant VPS as VPS 核心
-    participant Remote as 远端服务器 (192.168.1.100:3389)
-
-    Local->>ESP32: TCP 连接建立 (ESP32:3389)
-    Note over ESP32: 分配通道 ID (例如 2, 偶数)
-    ESP32->>KCP: 发送 CMD_CONNECT<br/>(Channel=2, Target=192.168.1.100:3389)
-    KCP->>VPS: 传输控制帧
-    
-    VPS->>Remote: 调用 connect() 连接 192.168.1.100:3389
-    Remote-->>VPS: 连接成功
-    VPS->>KCP: 发送 CMD_CONNECT_ACK (Channel=2, Status=Success)
-    KCP->>ESP32: 确认连接
-    
-    Note over ESP32, VPS: 全双工数据流通道打通，开始转发 RDP 流量
-    Local->>Remote: RDP 数据交互
-```
-
-#### 场景 4：跨网络局域网三层拓扑桥接（全网段出站透传）
-*   **目标**：本地用户连接 `ESP32:8888`，平移映射至远端局域网网关 `192.168.1.1:80`。
-
-场景 4 在协议层设计上与场景 3 完全一致。它们的核心区别在于部署拓扑：
-- 场景 3 是单点到单点的正向映射。
-- 场景 4 的目标地址是远端私有局域网网关（或通过路由导向整个子网）。
-- 从分路控制帧的角度看，ESP32 仍然向 VPS 发送 `CMD_CONNECT (Channel ID=2n, Target=192.168.1.1:80)`，VPS 收到后利用本地路由或网卡发送 TCP 握手。
-
----
-
-## 6. ESP32 无栈 SOCKS5 状态机 (ESP32 Stateless SOCKS5 State Machine)
-
-为降低 ESP32 的内存消耗，避免为每个通道分配大缓冲区存储 SOCKS5 握手帧，设计了**流式无栈状态机**。该状态机每次只处理输入的单个或多个字节，通过状态迁移即时处理，并直接向物理网络或 KCP 发送响应。
+为降低内存消耗并实现跨平台统一，系统设计了**流式无状态状态机**（在 `src/socks5.c` 实现）。作为 SOCKS5 代理入口（Entry）的对等端，通过该状态机流式解析来自客户端的握手及请求字节，通过状态迁移即时响应，并与底层 KCP 隧道的控制帧紧密联动。
 
 ### 6.1 状态定义
 
@@ -422,9 +375,9 @@ sequenceDiagram
 4.  `SOCKS5_STATE_REQ_ADDR_LEN`：读取域名长度（仅当 ATYP 为 Domain Name 时）。
 5.  `SOCKS5_STATE_REQ_ADDR_BODY`：流式读取地址字节（IPv4 为 4字节，IPv6 为 16字节，域名为变长）。
 6.  `SOCKS5_STATE_REQ_PORT`：读取端口号（2 字节）。
-7.  `SOCKS5_STATE_CONNECTING`：启动 `lwip_connect` 异步发起连接，暂停接收数据。
-8.  `SOCKS5_STATE_FORWARDING`：已连接，后续数据做纯透明双向透传。
-9.  `SOCKS5_STATE_ERROR`：错误状态，释放通道。
+7.  `SOCKS5_STATE_CONNECTING`：已解析目标，向对端发送 `CMD_CONNECT`，等待 `CMD_CONNECT_ACK`。
+8.  `SOCKS5_STATE_FORWARDING`：已收到 `CMD_CONNECT_ACK` 成功应答，进入纯透明双向数据转发。
+9.  `SOCKS5_STATE_ERROR`：协议解析错误或对端连接失败，释放通道。
 
 ### 6.2 状态转移图 (State Transition Diagram)
 
@@ -448,8 +401,8 @@ stateDiagram-v2
     
     SOCKS5_STATE_REQ_PORT --> SOCKS5_STATE_CONNECTING : 接收完 2 字节端口
     
-    SOCKS5_STATE_CONNECTING --> SOCKS5_STATE_FORWARDING : lwip_connect 成功，回复客户端连接成功
-    SOCKS5_STATE_CONNECTING --> SOCKS5_STATE_ERROR : lwip_connect 失败，回复客户端失败原因
+    SOCKS5_STATE_CONNECTING --> SOCKS5_STATE_FORWARDING : 收到 CMD_CONNECT_ACK (Success 0x00)，回复 SOCKS5_Success
+    SOCKS5_STATE_CONNECTING --> SOCKS5_STATE_ERROR : 收到 CMD_CONNECT_ACK (Fail 0x01)，回复 SOCKS5_Fail
     
     SOCKS5_STATE_FORWARDING --> [*] : TCP 连接关闭 (CMD_CLOSE)
     SOCKS5_STATE_ERROR --> [*] : 清理资源，发送 CMD_CLOSE
@@ -640,7 +593,7 @@ typedef struct {
 *   **接收端丢包统计**：接收端处理每个包时，统计实收包数与这些包头部声明的预期总包数（$N+R$）。在累计处理 100 个数据包或经过 1 秒时，计算其实时丢包率：
     $$\text{loss\_rate} = \frac{\text{expected\_packets} - \text{received\_packets}}{\text{expected\_packets}} \times 100\%$$
 *   **反馈控制帧**：计算出的丢包率（0-100的单字节值）通过控制通道以 `CMD_FEC_FEEDBACK (0x07)` 指令发送至发送端。
-*   **发送端调节策略**：发送端接收到反馈后，按照下表动态调整下一分组的 $N$ 与 $R$ 参数：
+*   **发送端调节策略**：系统默认以 $N=10, R=1$ 作为启动参数。发送端接收到反馈后，按照下表动态调整下一分组的 $N$ 与 $R$ 参数：
     | 丢包率区间 | 参数选择 | 冗余开销 | 适用场景 |
     | :--- | :--- | :--- | :--- |
     | **$0\%$** | $N=10, R=0$ | $0\%$ (直通模式) | 无丢包优质网络（节省带宽） |

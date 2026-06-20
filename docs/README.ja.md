@@ -121,13 +121,15 @@ flowchart LR
 └── src/                # ソースコードディレクトリ
     ├── bitun_osal.h    # 統一OS抽象化レイヤー（OSAL）インターフェース
     ├── encrypt.c/h     # AEAD暗号化、HKDF、リプレイ防御スライディングウィンドウ
+    ├── fec.c/h         # 自適応 Cauchy-RS FEC 符号化/復号化の実装
     ├── ikcp.c/h        # KCPプロトコルコアコード
     ├── socks5.c/h      # ステートレスなストリーミングSOCKS5パーサー
-    ├── tunnel.c/h      # 対称トンネル状態マシン、イベント、多重化、バックプレッシャー
-    ├── main.c          # CLIエントリおよび設定パーサー
+    ├── tunnel.c/h      # 对称トンネル状態マシン、イベント、多重化、バックプレッシャー
     └── linux/          # Linuxプラットフォーム実装
+        ├── main.c      # CLIエントリおよび設定パーサー
         ├── bitun_osal.c # Linux用OSAL実装
-        └── test_bitun_osal.c # OSALユニットテストスイート
+        ├── test_bitun_osal.c # OSALユニットテストスイート
+        └── test_fec.c  # FECユニットテスト用例
 ```
 
 ---
@@ -163,6 +165,14 @@ gcc -O2 -Wall -Wextra -pthread -Isrc -o test_bitun_osal src/linux/test_bitun_osa
 rm test_bitun_osal
 ```
 
+### FEC ユニットテストのコンパイルと実行
+プロジェクトのルートディレクトリで、以下のコマンドを実行して FEC ユニットテストをビルドおよび実行します：
+```bash
+gcc -O2 -Wall -Wextra -Isrc -o test_fec src/linux/test_fec.c src/fec.c
+./test_fec
+rm test_fec
+```
+
 ### システム統合テストの実行
 プロジェクトのルートディレクトリで、以下のコマンドを実行して一括統合テストを実行します：
 ```bash
@@ -177,7 +187,9 @@ bash run_integration_test.sh
 ```text
 bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 ```
-* `-p, --port`：ローカルバインドUDPポート。ローカル側でのSOCKS5 TCPリスニングポートも兼ねます。
+* `-p, --port`：ローカルバインドポート。構成を簡素化するため、本プログラムは**TCPとUDPの両方で同じポートを同時にバインドします**：
+  * **TCPポート**：ローカルクライアントが接続するためのローカルSOCKS5プロキシリスナーポート。
+  * **UDPポート**：KCPトンネル暗号化通信（両端のホールパンチング、ハンドシェイク、トラフィック）に使用。
 * `-r, --remote`：対端のUDP通信アドレス（`IP:Port`）。**このパラメータを省略すると、本ノードはパッシブ監視／動的アドレス学習モードで動作します**。
 * `-k, --psk`：事前共有鍵（PSK。自動的に32バイトにトリミングまたはパディングされます）。
 * `--odd` / `--even`：チャネルIDを生成する際の奇数／偶数を指定します。競合を避けるため、一方はodd、もう一方はevenにする必要があります。

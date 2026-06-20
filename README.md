@@ -124,13 +124,15 @@ flowchart LR
 └── src/                # 源码目录
     ├── bitun_osal.h    # 跨平台统一操作系统抽象层接口
     ├── encrypt.c/h     # AEAD 加密、HKDF、防重放滑动窗口实现
+    ├── fec.c/h         # 自适应 Cauchy-RS FEC 编解码实现
     ├── ikcp.c/h        # KCP 协议核心源码
     ├── socks5.c/h      # 流式无状态 SOCKS5 协议解析器
     ├── tunnel.c/h      # 对称隧道状态机、事件循环、多路复用与流控
-    ├── main.c          # 命令行入口及配置解析
     └── linux/          # Linux 平台具体实现
+        ├── main.c      # 命令行入口及配置解析
         ├── bitun_osal.c # Linux 平台具体实现
-        └── test_bitun_osal.c # OSAL 单元测试用例
+        ├── test_bitun_osal.c # OSAL 单元测试用例
+        └── test_fec.c  # FEC 单元测试用例
 ```
 
 ---
@@ -164,6 +166,14 @@ make clean
 gcc -O2 -Wall -Wextra -pthread -Isrc -o test_bitun_osal src/linux/test_bitun_osal.c src/linux/bitun_osal.c -lcrypto -lpthread
 ./test_bitun_osal
 rm test_bitun_osal
+```
+
+### 编译与运行 FEC 单元测试
+在项目根目录下，执行以下命令编译并运行前向纠错（FEC）单元测试：
+```bash
+gcc -O2 -Wall -Wextra -Isrc -o test_fec src/linux/test_fec.c src/fec.c
+./test_fec
+rm test_fec
 ```
 
 ### 运行系统集成测试

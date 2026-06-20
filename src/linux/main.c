@@ -6,7 +6,7 @@
 #include "bitun_osal.h"
 
 /* Global odd/even ID generator flag */
-int g_is_odd_id_generator = 0;
+int g_is_odd_id_generator = 1;
 
 static tunnel_t g_tun;
 volatile sig_atomic_t g_should_exit = 0;
