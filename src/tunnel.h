@@ -26,12 +26,7 @@ typedef enum {
     STATE_CONNECTED
 } tunnel_state_t;
 
-/* Channel Mapping Modes */
-typedef enum {
-    MODE_SOCKS5 = 0,      /* Dynamic remote forwarding */
-    MODE_FORWARD_L,       /* Local static port forwarding (-L) */
-    MODE_FORWARD_R        /* Remote static port forwarding (-R) */
-} mapping_mode_t;
+
 
 /* Channel Structure */
 typedef struct {
@@ -53,9 +48,6 @@ typedef struct {
     int local_port;
     char *remote_ip;
     int remote_port;
-    char *target_ip;
-    int target_port;
-    mapping_mode_t mode;
     uint8_t psk[PSK_LEN];
 } tunnel_config_t;
 

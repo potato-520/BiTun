@@ -6,7 +6,7 @@
 
 **BiTun** 是一个用纯 C 语言编写的、完全对称的、基于 KCP 与 UDP 的双向全双工加密通道工具。它不仅实现了强大的对称打洞与连接迁移能力，还融合了 ChaCha20-Poly1305 AEAD 加密、滑动窗口防重放、以及通道级流控设计。
 
-通过单一加密隧道，BiTun 同时支持了**动态 SOCKS5 代理（类似 `ssh -D`）**、**本地静态端口转发（类似 `ssh -L`）**和**远端反向静态转发（类似 `ssh -R`）**。
+通过单一加密隧道，BiTun 同时支持在两端同时运行双向的**动态 SOCKS5 代理**服务。
 
 > 🌐 **多语言文档 / Multi-language Documentation**:
 > *   [English Version](docs/README.en.md)
@@ -26,14 +26,14 @@ flowchart TD
     classDef network fill:#e76f51,stroke:#f4a261,stroke-width:2px,color:#fff;
     
     subgraph PeerA ["Peer A (Symmetric Endpoint)"]
-        A_TCP["本地 TCP 监听 / 建立连接<br>(SOCKS5 / Forward L / R)"]:::peerA
+        A_TCP["本地 TCP 监听 / 建立连接<br>(SOCKS5 代理)"]:::peerA
         A_Mux["多路复用分路控制层<br>(奇偶 ID 隔离, 通道级流控)"]:::peerA
         A_KCP["KCP 协议层<br>(低延迟重传、拥塞控制)"]:::peerA
         A_AEAD["AEAD 安全保护垫<br>(ChaCha20-Poly1305, 防重放)"]:::peerA
     end
 
     subgraph PeerB ["Peer B (Symmetric Endpoint)"]
-        B_TCP["本地 TCP 监听 / 建立连接<br>(SOCKS5 / Forward L / R)"]:::peerB
+        B_TCP["本地 TCP 监听 / 建立连接<br>(SOCKS5 代理)"]:::peerB
         B_Mux["多路复用分路控制层<br>(奇偶 ID 隔离, 通道级流控)"]:::peerB
         B_KCP["KCP 协议层<br>(低延迟重传、拥塞控制)"]:::peerB
         B_AEAD["AEAD 安全保护垫<br>(ChaCha20-Poly1305, 防重放)"]:::peerB
@@ -54,7 +54,7 @@ flowchart TD
 
 ### 流量平移数据流向 (Traffic Flows)
 
-#### 1. 动态 SOCKS5 代理模式 (ssh -D)
+#### 双向 SOCKS5 代理模式
 ```mermaid
 flowchart LR
     classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
@@ -65,32 +65,6 @@ flowchart LR
     M1_Client["浏览器 / 客户端"]:::app --> M1_PeerA["Peer A (SOCKS5 端口)"]:::bitunA
     M1_PeerA -- "加密 KCP 隧道" --> M1_PeerB["Peer B"]:::bitunB
     M1_PeerB --> M1_Target["目标服务器"]:::dest
-```
-
-#### 2. 本地静态端口转发模式 (ssh -L)
-```mermaid
-flowchart LR
-    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
-    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
-    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
-    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
-
-    M2_Client["本地应用"]:::app --> M2_PeerA["Peer A (本地监听)"]:::bitunA
-    M2_PeerA -- "加密 KCP 隧道" --> M2_PeerB["Peer B"]:::bitunB
-    M2_PeerB --> M2_Target["目标服务器"]:::dest
-```
-
-#### 3. 远端反向静态转发模式 (ssh -R)
-```mermaid
-flowchart LR
-    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
-    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
-    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
-    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
-
-    M3_Client["公网用户"]:::app --> M3_PeerB["Peer B (公网监听)"]:::bitunB
-    M3_PeerB -- "加密 KCP 隧道" --> M3_PeerA["Peer A"]:::bitunA
-    M3_PeerA --> M3_Target["本地目标服务"]:::dest
 ```
 
 ---
@@ -197,12 +171,10 @@ bash run_integration_test.sh
 
 ### 命令行参数语法
 ```text
-bitun -m <mode> -p <local_port> [-r <remote_ip:remote_port>] [-t <target_ip:target_port>] -k <psk> [--odd | --even]
+bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 ```
-* `-m, --mode`：运行模式。可选 `socks5`（动态代理）、`forward_l`（本地静态转发）、`forward_r`（远端静态转发）。
-* `-p, --port`：本地绑定端口。在 `socks5`/`forward_l` 模式下也作为本地 TCP 监听端口。
+* `-p, --port`：本地绑定端口。也作为本地 SOCKS5 TCP 监听端口。
 * `-r, --remote`：对端 UDP 通信地址（`IP:Port`）。**若省略此参数，则本端进入被动监听/动态学习模式**。
-* `-t, --target`：目标映射地址（`IP:Port`）。静态转发模式（`forward_l` / `forward_r`）下为必填项。
 * `-k, --psk`：预共享密钥（PSK，将自动处理为 32 字节密钥）。
 * `--odd` / `--even`：设置本端生成通道 ID 时是生成奇数还是偶数。两端必须一端为 odd，另一端为 even 以规避并发冲突。
 
@@ -213,45 +185,23 @@ bitun -m <mode> -p <local_port> [-r <remote_ip:remote_port>] [-t <target_ip:targ
 #### 场景 1：双向 SOCKS5 动态代理 (双进程本地模拟)
 * **Peer A** (在 UDP 9000 端口提供 SOCKS5 代理，主动向 Peer B 打洞，奇数 ID 侧)：
   ```bash
-  ./bitun -m socks5 -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
   ```
 * **Peer B** (在 UDP 9001 端口提供 SOCKS5 代理，主动向 Peer A 打洞，偶数 ID 侧)：
   ```bash
-  ./bitun -m socks5 -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
   ```
 * *测试*：
-  连接本地 `127.0.0.1:9000` 或 `127.0.0.1:9001` 的 SOCKS5 端口即可实现代理上网。
+  两端同时运行 SOCKS5 代理服务。连接本地 `127.0.0.1:9000` 或 `127.0.0.1:9001` 的 SOCKS5 端口即可访问对端出口 of 代理。
 
 #### 场景 2：主动 - 被动动态学习打洞 (公网服务器与内网终端对称连接)
 * **VPS 侧** (监听本地 UDP 9000，等待接入，动态学习客户端公网 IP:Port)：
   ```bash
-  ./bitun -m socks5 -p 9000 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -k MySecretPSKKey123456789012345678 --odd
   ```
 * **本地内网侧** (监听 UDP 9001，向公网 VPS 主动持续打洞探测)：
   ```bash
-  ./bitun -m socks5 -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
-  ```
-
-#### 场景 3：静态本地端口正向映射 (类似 `ssh -L`)
-假设您想把本地 `127.0.0.1:3389` 的 RDP 流量，通过隧道直连到对端能够触达的远端内网主机 `192.168.1.100:3389`：
-* **本端** (监听本地 TCP 3389，接收连接并强制送入通道)：
-  ```bash
-  ./bitun -m forward_l -p 3389 -r <对端_IP>:9001 -t 192.168.1.100:3389 -k MySecretPSKKey123456789012345678 --even
-  ```
-* **对端** (接收通道连接，并在其所在的内网环境中发起对 `192.168.1.100:3389` 的 TCP 连接)：
-  ```bash
-  ./bitun -m socks5 -p 9001 -r <本端_IP>:3389 -k MySecretPSKKey123456789012345678 --odd
-  ```
-
-#### 场景 4：静态远端端口反向映射 (类似 `ssh -R`)
-假设您想让公网 VPS 监听 8080 端口，任何访问 VPS:8080 的公网流量都会反向平移到您本地的 Web 服务器 `127.0.0.1:80`：
-* **公网 VPS 侧** (监听本地 TCP 8080 端口接收公网来路，并投递入隧道)：
-  ```bash
-  ./bitun -m forward_r -p 8080 -k MySecretPSKKey123456789012345678 --odd -t 127.0.0.1:80
-  ```
-* **本地内网侧** (接收通道的连接，并在本地主动建立 TCP 连接至 `127.0.0.1:80`)：
-  ```bash
-  ./bitun -m socks5 -p 9001 -r <VPS_IP>:8080 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
   ```
 
 ---

@@ -123,8 +123,8 @@ int tunnel_init(tunnel_t *tun, const tunnel_config_t *config) {
     bitun_socket_t queue_fd = bitun_osal_queue_get_read_fd(tun->dns_queue);
     bitun_osal_poll_add(tun->poll_set, queue_fd, BITUN_POLL_IN);
 
-    /* Open local TCP listener if we are forwarding locally or SOCKS5 on this side */
-    if (config->mode == MODE_SOCKS5 || config->mode == MODE_FORWARD_L) {
+    /* Open local TCP listener unconditionally if config->local_port > 0 */
+    if (config->local_port > 0) {
         tun->tcp_listen_fd = bitun_osal_socket_create(AF_INET, SOCK_STREAM, 0);
         if (tun->tcp_listen_fd >= 0) {
             bitun_osal_socket_set_reuseaddr(tun->tcp_listen_fd);
@@ -683,24 +683,7 @@ void tunnel_run(tunnel_t *tun) {
 
                         bitun_osal_poll_add(tun->poll_set, client_fd, BITUN_POLL_IN);
 
-                        if (tun->config.mode == MODE_SOCKS5) {
-                            /* SOCKS5 proxy: wait for handshake before triggering remote connect */
-                            printf("[SOCKS5] Accepted local SOCKS5 client. Handshake started. Channel ID: %u\n", ch->channel_id);
-                        } else {
-                            /* Local Static Port Forwarding L -> Connect to target */
-                            printf("[Forward-L] Accepted client connection. Sending CMD_CONNECT for Channel ID: %u\n", ch->channel_id);
-                            
-                            /* Payload: IPV4 + Target Port + IP */
-                            uint8_t payload[7];
-                            payload[0] = ADDR_TYPE_IPV4;
-                            uint16_t port_be = bitun_htobe16(tun->config.target_port);
-                            memcpy(payload + 1, &port_be, 2);
-                            struct in_addr ip_addr;
-                            inet_pton(AF_INET, tun->config.target_ip, &ip_addr);
-                            memcpy(payload + 3, &ip_addr.s_addr, 4);
-
-                            send_control_frame(tun, ch->channel_id, CMD_CONNECT, payload, 7);
-                        }
+                        printf("[SOCKS5] Accepted local SOCKS5 client. Handshake started. Channel ID: %u\n", ch->channel_id);
                     } else {
                         bitun_osal_socket_close(client_fd);
                     }
@@ -755,7 +738,7 @@ void tunnel_run(tunnel_t *tun) {
 
                         int read_len = bitun_osal_socket_recv(fd, read_buf, BUFFER_SIZE, 0);
                         if (read_len > 0) {
-                            if (tun->config.mode == MODE_SOCKS5 && !ch->socks5_handshake_done) {
+                            if (!ch->socks5_handshake_done) {
                                 /* Parse SOCKS5 Handshake Data */
                                 uint8_t resp[BUFFER_SIZE];
                                 size_t resp_len = 0;
@@ -873,49 +856,44 @@ void tunnel_run(tunnel_t *tun) {
                         uint16_t target_port = bitun_be16toh(target_port_be);
                         ch->port = target_port;
 
-                        if (addr_type == ADDR_TYPE_SOCKS5) {
-                            /* remote wants SOCKS5. Initialize and ACK immediately */
-                            ch->socks5_handshake_done = 0;
-                            socks5_init(&ch->socks5_ctx);
-                            send_control_frame(tun, channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x00", 1);
-                        } else {
-                            /* Connect to target address (IPv4 or Domain) */
-                            if (addr_type == ADDR_TYPE_IPV4) {
-                                struct sockaddr_in target_addr;
-                                memset(&target_addr, 0, sizeof(target_addr));
-                                target_addr.sin_family = AF_INET;
-                                target_addr.sin_port = htons(target_port);
-                                memcpy(&target_addr.sin_addr.s_addr, payload + 3, 4);
+                        ch->socks5_handshake_done = 1;
 
-                                int target_fd = bitun_osal_socket_create(AF_INET, SOCK_STREAM, 0);
-                                if (target_fd >= 0) {
-                                    bitun_osal_socket_set_nonblocking(target_fd);
-                                    printf("[Forward-R] Connecting to target IPv4 %s:%d...\n",
-                                           inet_ntoa(target_addr.sin_addr), target_port);
-                                    
-                                    int c_ret = bitun_osal_socket_connect(target_fd, (struct sockaddr *)&target_addr, sizeof(target_addr));
-                                    if (c_ret == 0 || errno == EINPROGRESS) {
-                                        ch->tcp_fd = target_fd;
-                                        bitun_osal_poll_add(tun->poll_set, target_fd, BITUN_POLL_IN | BITUN_POLL_OUT);
-                                    } else {
-                                        bitun_osal_socket_close(target_fd);
-                                        send_control_frame(tun, channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
-                                        close_channel(tun, channel_id);
-                                    }
+                        /* Connect to target address (IPv4 or Domain) */
+                        if (addr_type == ADDR_TYPE_IPV4) {
+                            struct sockaddr_in target_addr;
+                            memset(&target_addr, 0, sizeof(target_addr));
+                            target_addr.sin_family = AF_INET;
+                            target_addr.sin_port = htons(target_port);
+                            memcpy(&target_addr.sin_addr.s_addr, payload + 3, 4);
+
+                            int target_fd = bitun_osal_socket_create(AF_INET, SOCK_STREAM, 0);
+                            if (target_fd >= 0) {
+                                bitun_osal_socket_set_nonblocking(target_fd);
+                                printf("[Forward-R] Connecting to target IPv4 %s:%d...\n",
+                                       inet_ntoa(target_addr.sin_addr), target_port);
+                                
+                                int c_ret = bitun_osal_socket_connect(target_fd, (struct sockaddr *)&target_addr, sizeof(target_addr));
+                                if (c_ret == 0 || errno == EINPROGRESS) {
+                                    ch->tcp_fd = target_fd;
+                                    bitun_osal_poll_add(tun->poll_set, target_fd, BITUN_POLL_IN | BITUN_POLL_OUT);
                                 } else {
+                                    bitun_osal_socket_close(target_fd);
                                     send_control_frame(tun, channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
                                     close_channel(tun, channel_id);
                                 }
-                            } else if (addr_type == ADDR_TYPE_DOMAIN) {
-                                uint8_t dom_len = payload[3];
-                                char *domain = malloc(dom_len + 1);
-                                if (domain) {
-                                    memcpy(domain, payload + 4, dom_len);
-                                    domain[dom_len] = '\0';
-                                    printf("[DNS] Dispatching async resolution for domain: %s\n", domain);
-                                    bitun_osal_dns_resolve_async(domain, channel_id, tun->dns_queue);
-                                    free(domain);
-                                }
+                            } else {
+                                send_control_frame(tun, channel_id, CMD_CONNECT_ACK, (uint8_t *)"\x01", 1);
+                                close_channel(tun, channel_id);
+                            }
+                        } else if (addr_type == ADDR_TYPE_DOMAIN) {
+                            uint8_t dom_len = payload[3];
+                            char *domain = malloc(dom_len + 1);
+                            if (domain) {
+                                memcpy(domain, payload + 4, dom_len);
+                                domain[dom_len] = '\0';
+                                printf("[DNS] Dispatching async resolution for domain: %s\n", domain);
+                                bitun_osal_dns_resolve_async(domain, channel_id, tun->dns_queue);
+                                free(domain);
                             }
                         }
                     } else {
@@ -929,17 +907,13 @@ void tunnel_run(tunnel_t *tun) {
                         if (status == 0x00) {
                             printf("[Channel] Channel %u Target connected successfully!\n", channel_id);
                             ch->socks5_handshake_done = 1;
-                            if (tun->config.mode == MODE_SOCKS5) {
-                                uint8_t socks5_resp[10] = {0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-                                bitun_osal_socket_send(ch->tcp_fd, socks5_resp, 10, 0);
-                            }
+                            uint8_t socks5_resp[10] = {0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+                            bitun_osal_socket_send(ch->tcp_fd, socks5_resp, 10, 0);
                             bitun_osal_poll_add(tun->poll_set, ch->tcp_fd, BITUN_POLL_IN);
                         } else {
                             printf("[Channel] Channel %u target connection refused.\n", channel_id);
-                            if (tun->config.mode == MODE_SOCKS5) {
-                                uint8_t socks5_resp[10] = {0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-                                bitun_osal_socket_send(ch->tcp_fd, socks5_resp, 10, 0);
-                            }
+                            uint8_t socks5_resp[10] = {0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+                            bitun_osal_socket_send(ch->tcp_fd, socks5_resp, 10, 0);
                             close_channel(tun, channel_id);
                         }
                     } else if (cmd == CMD_DATA) {

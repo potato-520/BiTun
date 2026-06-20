@@ -6,7 +6,7 @@
 
 **BiTun** is a lightweight, fully symmetric, point-to-point encrypted tunnel tool written in pure C. Operating over KCP and UDP, it provides high-performance duplex tunneling with robust NAT hole punching, connection migration, ChaCha20-Poly1305 AEAD encryption, and anti-replay protections.
 
-Over a single encrypted UDP tunnel, BiTun supports **Dynamic SOCKS5 Proxies (equivalent to `ssh -D`)**, **Local static Port Forwarding (equivalent to `ssh -L`)**, and **Remote reverse Port Forwarding (equivalent to `ssh -R`)** concurrently.
+Over a single encrypted UDP tunnel, BiTun supports bidirectional **Dynamic SOCKS5 Proxies** concurrently on both endpoints.
 
 > 🌐 **Multi-language Documentation**:
 > *   [Chinese Version (中文版)](../README.md)
@@ -26,14 +26,14 @@ flowchart TD
     classDef network fill:#e76f51,stroke:#f4a261,stroke-width:2px,color:#fff;
     
     subgraph PeerA ["Peer A (Symmetric Endpoint)"]
-        A_TCP["Local TCP Listen / Connect<br>(SOCKS5 / Forward L / R)"]:::peerA
+        A_TCP["Local TCP Listen / Connect<br>(SOCKS5 Proxy)"]:::peerA
         A_Mux["Channel Multiplexing Layer<br>(Odd/Even IDs, Flow Control)"]:::peerA
         A_KCP["KCP Layer<br>(Low Latency Retransmit, Congestion Control)"]:::peerA
         A_AEAD["AEAD Security Shim<br>(ChaCha20-Poly1305, Anti-Replay)"]:::peerA
     end
 
     subgraph PeerB ["Peer B (Symmetric Endpoint)"]
-        B_TCP["Local TCP Listen / Connect<br>(SOCKS5 / Forward L / R)"]:::peerB
+        B_TCP["Local TCP Listen / Connect<br>(SOCKS5 Proxy)"]:::peerB
         B_Mux["Channel Multiplexing Layer<br>(Odd/Even IDs, Flow Control)"]:::peerB
         B_KCP["KCP Layer<br>(Low Latency Retransmit, Congestion Control)"]:::peerB
         B_AEAD["AEAD Security Shim<br>(ChaCha20-Poly1305, Anti-Replay)"]:::peerB
@@ -54,7 +54,7 @@ flowchart TD
 
 ### Traffic Flow Patterns (Traffic Flows)
 
-#### 1. Dynamic SOCKS5 Proxy Mode (ssh -D)
+#### Bidirectional SOCKS5 Proxy Mode
 ```mermaid
 flowchart LR
     classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
@@ -65,32 +65,6 @@ flowchart LR
     M1_Client["Browser / Client"]:::app --> M1_PeerA["Peer A (SOCKS5 Port)"]:::bitunA
     M1_PeerA -- "Encrypted KCP Tunnel" --> M1_PeerB["Peer B"]:::bitunB
     M1_PeerB --> M1_Target["Target Server"]:::dest
-```
-
-#### 2. Local Port Forwarding Mode (ssh -L)
-```mermaid
-flowchart LR
-    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
-    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
-    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
-    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
-
-    M2_Client["Local App"]:::app --> M2_PeerA["Peer A (Local Listener)"]:::bitunA
-    M2_PeerA -- "Encrypted KCP Tunnel" --> M2_PeerB["Peer B"]:::bitunB
-    M2_PeerB --> M2_Target["Target Server"]:::dest
-```
-
-#### 3. Remote Port Forwarding Mode (ssh -R)
-```mermaid
-flowchart LR
-    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
-    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
-    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
-    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
-
-    M3_Client["Public User"]:::app --> M3_PeerB["Peer B (Public Listener)"]:::bitunB
-    M3_PeerB -- "Encrypted KCP Tunnel" --> M3_PeerA["Peer A"]:::bitunA
-    M3_PeerA --> M3_Target["Local Target Service"]:::dest
 ```
 
 ---
@@ -199,12 +173,10 @@ bash run_integration_test.sh
 
 ### Command Line Syntax
 ```text
-bitun -m <mode> -p <local_port> [-r <remote_ip:remote_port>] [-t <target_ip:target_port>] -k <psk> [--odd | --even]
+bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 ```
-* `-m, --mode`：Operation mode. Options are `socks5`, `forward_l` (local port forwarding), and `forward_r` (remote port forwarding).
-* `-p, --port`：Local UDP port. Also acts as the TCP listener port in `socks5` or `forward_l` modes.
+* `-p, --port`：Local UDP port. Also acts as the SOCKS5 TCP listener port on the local side.
 * `-r, --remote`：Remote peer UDP endpoint (`IP:Port`). **Omit this parameter to run in passive dynamic learning mode**.
-* `-t, --target`：Target mapping destination (`IP:Port`). Required in static forwarding modes.
 * `-k, --psk`：Pre-shared key (automatically padded or truncated to 32 bytes).
 * `--odd` / `--even`：Configures the peer to generate Odd or Even Channel IDs to prevent collisions. One side must be odd and the other must be even.
 
@@ -212,48 +184,26 @@ bitun -m <mode> -p <local_port> [-r <remote_ip:remote_port>] [-t <target_ip:targ
 
 ### 💡 Application Scenarios
 
-#### Scenario 1: Symmetric SOCKS5 Proxy (Double Process Simulation)
+#### Scenario 1: Symmetric Bidirectional SOCKS5 Proxy (Double Process Simulation)
 * **Peer A** (SOCKS5 proxy listener on local port 9000, initiating connection to B, Odd IDs):
   ```bash
-  ./bitun -m socks5 -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
   ```
 * **Peer B** (SOCKS5 proxy listener on local port 9001, initiating connection to A, Even IDs):
   ```bash
-  ./bitun -m socks5 -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
   ```
 * *Test*:
-  Configure your browser or curl to use `127.0.0.1:9000` or `127.0.0.1:9001` as SOCKS5 proxies to surf the web.
+  Both Peer A and Peer B now serve as SOCKS5 proxies simultaneously. Configure your browser or curl to use either `127.0.0.1:9000` or `127.0.0.1:9001` as a SOCKS5 proxy to access services behind the other end.
 
 #### Scenario 2: Active-Passive Hole Punching (VPS Hub & LAN Node)
 * **VPS Side** (Listens on UDP 9000, dynamically learning the client NAT address):
   ```bash
-  ./bitun -m socks5 -p 9000 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -k MySecretPSKKey123456789012345678 --odd
   ```
 * **LAN Side** (Listens on UDP 9001, actively punching to the public VPS):
   ```bash
-  ./bitun -m socks5 -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
-  ```
-
-#### Scenario 3: Local Port Forwarding (equivalent to `ssh -L`)
-To map local RDP connections (`127.0.0.1:3389`) to a remote target (`192.168.1.100:3389`):
-* **Local Peer** (Listens on TCP 3389, forwarding connections to the tunnel):
-  ```bash
-  ./bitun -m forward_l -p 3389 -r <Remote_IP>:9001 -t 192.168.1.100:3389 -k MySecretPSKKey123456789012345678 --even
-  ```
-* **Remote Peer** (Listens on UDP 9001, accepting tunnel requests and connecting to the target):
-  ```bash
-  ./bitun -m socks5 -p 9001 -r <Local_IP>:3389 -k MySecretPSKKey123456789012345678 --odd
-  ```
-
-#### Scenario 4: Remote Port Forwarding (equivalent to `ssh -R`)
-To listen on VPS port 8080 and forward incoming traffic back to a local web server (`127.0.0.1:80`):
-* **VPS Peer** (Listens on TCP 8080, forwarding incoming TCP connections to the tunnel):
-  ```bash
-  ./bitun -m forward_r -p 8080 -k MySecretPSKKey123456789012345678 --odd -t 127.0.0.1:80
-  ```
-* **Local Peer** (Listens on UDP 9001, receiving tunnel packets and establishing local TCP to port 80):
-  ```bash
-  ./bitun -m socks5 -p 9001 -r <VPS_IP>:8080 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
   ```
 
 ---

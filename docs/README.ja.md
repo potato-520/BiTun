@@ -6,7 +6,7 @@
 
 **BiTun** は、純C言語で記述された、完全に対称的な（非対称な役割を持たない）KCPおよびUDPベースの双方向フルデュプレックス暗号化トンネルツールです。強力なホールパンチング、コネクションマイグレーション、ChaCha20-Poly1305 AEAD暗号化、およびリプレイ攻撃防御を統合しています。
 
-単一の暗号化UDPトンネル上で、**動的SOCKS5プロキシ（`ssh -D`相当）**、**ローカル静的ポートフォワーディング（`ssh -L`相当）**、**リモート逆方向静的ポートフォワーディング（`ssh -R`相当）**を同時にサポートします。
+単一の暗号化UDPトンネル上で、両端点において同時に双方向の**動的SOCKS5プロキシ**をサポートします。
 
 > 🌐 **多言語ドキュメント / Multi-language Documentation**:
 > *   [中国語版メインドキュメント (README.md)](../README.md)
@@ -26,14 +26,14 @@ flowchart TD
     classDef network fill:#e76f51,stroke:#f4a261,stroke-width:2px,color:#fff;
     
     subgraph PeerA ["Peer A (Symmetric Endpoint)"]
-        A_TCP["ローカル TCP 受信 / 接続<br>(SOCKS5 / Forward L / R)"]:::peerA
+        A_TCP["ローカル TCP 受信 / 接続<br>(SOCKS5 プロキシ)"]:::peerA
         A_Mux["多重化チャネル制御層<br>(奇偶 ID 隔離、フロー制御)"]:::peerA
         A_KCP["KCP プロトコル層<br>(低遅延再転送、混雑制御)"]:::peerA
         A_AEAD["AEAD セキュリティ層<br>(ChaCha20-Poly1305、防御)"]:::peerA
     end
 
     subgraph PeerB ["Peer B (Symmetric Endpoint)"]
-        B_TCP["ローカル TCP 受信 / 接続<br>(SOCKS5 / Forward L / R)"]:::peerB
+        B_TCP["ローカル TCP 受信 / 接続<br>(SOCKS5 プロキシ)"]:::peerB
         B_Mux["多重化チャネル制御層<br>(奇偶 ID 隔離、フロー制御)"]:::peerB
         B_KCP["KCP プロトコル層<br>(低遅延再転送、混雑制御)"]:::peerB
         B_AEAD["AEAD セキュリティ層<br>(ChaCha20-Poly1305、防御)"]:::peerB
@@ -54,7 +54,7 @@ flowchart TD
 
 ### データフローパターン (Traffic Flows)
 
-#### 1. 動的 SOCKS5 プロキシモード (ssh -D)
+#### 双方向 SOCKS5 プロキシモード
 ```mermaid
 flowchart LR
     classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
@@ -65,32 +65,6 @@ flowchart LR
     M1_Client["ブラウザ / クライアント"]:::app --> M1_PeerA["Peer A (SOCKS5ポート)"]:::bitunA
     M1_PeerA -- "暗号化 KCP トンネル" --> M1_PeerB["Peer B"]:::bitunB
     M1_PeerB --> M1_Target["ターゲットサーバー"]:::dest
-```
-
-#### 2. ローカル静的ポートフォワーディングモード (ssh -L)
-```mermaid
-flowchart LR
-    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
-    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
-    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
-    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
-
-    M2_Client["ローカルアプリ"]:::app --> M2_PeerA["Peer A (ローカル監視)"]:::bitunA
-    M2_PeerA -- "暗号化 KCP トンネル" --> M2_PeerB["Peer B"]:::bitunB
-    M2_PeerB --> M2_Target["ターゲットサーバー"]:::dest
-```
-
-#### 3. リモート逆方向静的ポートフォワーディングモード (ssh -R)
-```mermaid
-flowchart LR
-    classDef app fill:#e63946,stroke:#b11e31,stroke-width:1px,color:#fff;
-    classDef bitunA fill:#1d3557,stroke:#457b9d,stroke-width:1px,color:#fff;
-    classDef bitunB fill:#2a9d8f,stroke:#264653,stroke-width:1px,color:#fff;
-    classDef dest fill:#2b2d42,stroke:#8d99ae,stroke-width:1px,color:#fff;
-
-    M3_Client["パブリックユーザ"]:::app --> M3_PeerB["Peer B (パブリック監視)"]:::bitunB
-    M3_PeerB -- "暗号化 KCP トンネル" --> M3_PeerA["Peer A"]:::bitunA
-    M3_PeerA --> M3_Target["ローカルサービス"]:::dest
 ```
 
 ---
@@ -198,12 +172,10 @@ bash run_integration_test.sh
 
 ### コマンドラインパラメータの構文
 ```text
-bitun -m <mode> -p <local_port> [-r <remote_ip:remote_port>] [-t <target_ip:target_port>] -k <psk> [--odd | --even]
+bitun -p <local_port> [-r <remote_ip:remote_port>] -k <psk> [--odd | --even]
 ```
-* `-m, --mode`：動作モード。`socks5`（動的プロキシ）、`forward_l`（ローカル静的転送）、`forward_r`（リモート逆方向転送）から選択。
-* `-p, --port`：ローカルバインドUDPポート。`socks5`または`forward_l`モードではTCPのリスニングポートも兼ねます。
+* `-p, --port`：ローカルバインドUDPポート。ローカル側でのSOCKS5 TCPリスニングポートも兼ねます。
 * `-r, --remote`：対端のUDP通信アドレス（`IP:Port`）。**このパラメータを省略すると、本ノードはパッシブ監視／動的アドレス学習モードで動作します**。
-* `-t, --target`：転送先ターゲットアドレス（`IP:Port`）。静的転送モード（`forward_l` / `forward_r`）では必須です。
 * `-k, --psk`：事前共有鍵（PSK。自動的に32バイトにトリミングまたはパディングされます）。
 * `--odd` / `--even`：チャネルIDを生成する際の奇数／偶数を指定します。競合を避けるため、一方はodd、もう一方はevenにする必要があります。
 
@@ -214,45 +186,23 @@ bitun -m <mode> -p <local_port> [-r <remote_ip:remote_port>] [-t <target_ip:targ
 #### シナリオ 1：双方向 SOCKS5 動的プロキシ（ローカルでの2プロセスシミュレーション）
 * **Peer A** (UDP 9000番ポートでSOCKS5プロキシを起動し、Peer Bに向けてホールパンチを実行。奇数ID生成)：
   ```bash
-  ./bitun -m socks5 -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -r 127.0.0.1:9001 -k MySecretPSKKey123456789012345678 --odd
   ```
 * **Peer B** (UDP 9001番ポートでSOCKS5プロキシを起動し、Peer Aに向けてホールパンチを実行。偶数ID生成)：
   ```bash
-  ./bitun -m socks5 -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r 127.0.0.1:9000 -k MySecretPSKKey123456789012345678 --even
   ```
 * *テスト方法*：
-  ブラウザや curl コマンドのプロキシ先に `127.0.0.1:9000` または `127.0.0.1:9001` を指定してアクセスします。
+  Peer AとPeer Bが同時にSOCKS5プロキシとして機能します。ブラウザや curl コマンドのプロキシ先に `127.0.0.1:9000` または `127.0.0.1:9001` を指定してアクセスします。
 
 #### シナリオ 2：アクティブ - パッシブ動的学習パンチング (公網サーバーと内網端末)
 * **VPS側** (UDP 9000番ポートで待ち受け。クライアントの接続時のグローバルIP:Portを動的に学習してバインド)：
   ```bash
-  ./bitun -m socks5 -p 9000 -k MySecretPSKKey123456789012345678 --odd
+  ./bitun -p 9000 -k MySecretPSKKey123456789012345678 --odd
   ```
 * **ローカル内網側** (UDP 9001番ポートで起動し、VPSのパブリックIPに向けて継続的にパンチングを実行)：
   ```bash
-  ./bitun -m socks5 -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
-  ```
-
-#### シナリオ 3：ローカル静的ポートフォワーディング (例：`ssh -L`)
-ローカルPCのRDP接続（`127.0.0.1:3389`）を、トンネルを経由して対端がアクセス可能な内網サーバー（`192.168.1.100:3389`）へマッピングする場合：
-* **ローカルPC側** (TCP 3389ポートで待受け、接続をトンネルへ強制送入)：
-  ```bash
-  ./bitun -m forward_l -p 3389 -r <Remote_IP>:9001 -t 192.168.1.100:3389 -k MySecretPSKKey123456789012345678 --even
-  ```
-* **リモート対端側** (UDP 9001ポートで待ち受け、トンネルからの接続をターゲット `192.168.1.100:3389` へ転送)：
-  ```bash
-  ./bitun -m socks5 -p 9001 -r <Local_IP>:3389 -k MySecretPSKKey123456789012345678 --odd
-  ```
-
-#### シナリオ 4：リモート静的ポートフォワーディング (例：`ssh -R`)
-パブリックVPSの8080番ポートで待ち受け、アクセスされたパブリックトラフィックを、ローカル内網のWebサーバー（`127.0.0.1:80`）へ逆方向に転送する場合：
-* **パブリックVPS側** (TCP 8080ポートで待ち受け、接続をトンネルへ送入)：
-  ```bash
-  ./bitun -m forward_r -p 8080 -k MySecretPSKKey123456789012345678 --odd -t 127.0.0.1:80
-  ```
-* **ローカル内網側** (UDP 9001で待ち受け、トンネルから受信したトラフィックをローカルの `127.0.0.1:80` へ接続)：
-  ```bash
-  ./bitun -m socks5 -p 9001 -r <VPS_IP>:8080 -k MySecretPSKKey123456789012345678 --even
+  ./bitun -p 9001 -r <VPS_IP>:9000 -k MySecretPSKKey123456789012345678 --even
   ```
 
 ---
